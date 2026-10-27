@@ -141,7 +141,8 @@ jobs:
         with:
           key: release-macos
       - name: Version from the tag
-        run: sed -i '' "1,/^version = \".*\"/s//version = \"${TAG#v}\"/" Cargo.toml
+        # Not sed: macOS sed has no `0,/re/` and rejects `s//`. Only the first match changes.
+        run: perl -0pi -e 's/^version = ".*"/version = "'"${TAG#v}"'"/m' Cargo.toml
       - name: Build
         env:
           MACOSX_DEPLOYMENT_TARGET: "12.0"
@@ -242,8 +243,7 @@ jobs:
         shell: bash
         run: |
           v="${TAG#v}"
-          sed -i.bak "0,/^version = \".*\"/s//version = \"$v\"/" Cargo.toml 2>/dev/null \
-            || sed -i.bak "1,/^version = \".*\"/s//version = \"$v\"/" Cargo.toml
+          perl -0pi -e 's/^version = ".*"/version = "'"$v"'"/m' Cargo.toml
           printf '{"version":"%s"}' "${v%%-*}" > app/release.json
       - name: Build
         shell: bash
@@ -272,12 +272,12 @@ jobs:
 
   release:
     needs: [build, windows, macos, tray, client]
-    # The client is a beta: publish when the agent builds pass, whatever the client did.
-    # `!cancelled()` rather than `always()`: cancelling a run must stop it signing and
-    # publishing.
+    # The client is a beta, and the macOS agent is not tried on a real Mac yet: publish when
+    # the Linux and Windows builds pass, whatever those did. `!cancelled()` rather than
+    # `always()`: cancelling a run must stop it signing and publishing.
     if: >-
       !cancelled() && needs.build.result == 'success' && needs.windows.result == 'success' &&
-      needs.macos.result == 'success' && needs.tray.result == 'success'
+      needs.tray.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
