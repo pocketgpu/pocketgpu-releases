@@ -1,0 +1,367 @@
+name: Release
+
+# Builds and publishes a PocketGPU release from the private code repository pocketgpu/pocketgpu.
+# It runs here because a public repository's runners cost no Actions minutes. The source of
+# this file is .github/releases-repo/release.yml in the code repository; copy changes here.
+#
+# Start it with the tag of a commit in the code repository (v1.2.0 or v1.2.0-rc.1): pushing the
+# tag there starts it (release-agent.yml), or Actions → Release → Run workflow here. The
+# binaries take their version from the tag. Needs, in this repository's settings:
+#   secrets   SOURCE_TOKEN          fine-grained token, Contents: read on pocketgpu/pocketgpu
+#             MINISIGN_SECRET_KEY   the contents of the minisign secret key
+#             MINISIGN_PASSWORD
+#   variables PGPU_DEFAULT_RELAYS, PGPU_PUSH_URL (our servers, built into the binaries;
+#             empty: n0's public relays and the default push address)
+# Run logs are public: nothing here may print a secret or the source.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag in pocketgpu/pocketgpu, like v1.2.0
+        required: true
+  repository_dispatch:
+    types: [release]
+
+permissions:
+  contents: read
+
+# One run per tag; a second start waits rather than publishing twice.
+concurrency:
+  group: release-${{ inputs.tag || github.event.client_payload.tag }}
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+  PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
+  PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The tag is a version
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] ||
+            { echo "tag $TAG is not like v1.2.3 or v1.2.3-rc.1"; exit 1; }
+
+  build:
+    needs: version
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            docker: amd64
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            docker: arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: refs/tags/${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install cargo-zigbuild and zig
+        # Pinned: these link the signed Linux binaries.
+        run: pip install cargo-zigbuild==0.24.0 ziglang==0.17.0
+      # glibc 2.28: one binary for Debian 10+, Ubuntu 18.10+, RHEL 8+. Not musl: NVML is
+      # loaded at run time, which a static binary can't do.
+      - name: Version from the tag
+        shell: bash
+        run: sed -i "0,/^version = \".*\"/s//version = \"${TAG#v}\"/" Cargo.toml
+      - name: Build
+        run: cargo zigbuild --release -p pocketgpu --target ${{ matrix.target }}.2.28
+      - name: Package
+        run: |
+          mkdir -p dist/${{ matrix.docker }}
+          cp target/${{ matrix.target }}/release/pocketgpu dist/${{ matrix.docker }}/
+          tar -czf pocketgpu-${{ matrix.arch }}-linux.tar.gz -C target/${{ matrix.target }}/release pocketgpu
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-${{ matrix.arch }}
+          path: |
+            pocketgpu-${{ matrix.arch }}-linux.tar.gz
+            dist/
+
+  windows:
+    name: Build Windows x86_64
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: refs/tags/${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-windows
+      # MSVC with a static C runtime: no Visual C++ redistributable needed.
+      - name: Version from the tag
+        shell: bash
+        run: sed -i "0,/^version = \".*\"/s//version = \"${TAG#v}\"/" Cargo.toml
+      - name: Build
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release -p pocketgpu --target x86_64-pc-windows-msvc
+      - name: Package
+        shell: bash
+        run: tar -czf pocketgpu-x86_64-windows.tar.gz -C target/x86_64-pc-windows-msvc/release pocketgpu.exe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-windows
+          path: pocketgpu-x86_64-windows.tar.gz
+
+  # The macOS agent for Apple silicon (F26). Not notarized yet: `curl` doesn't mark downloads
+  # as quarantined, so the install script's binary runs; the linker signs it ad hoc.
+  macos:
+    name: Build macOS aarch64
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: refs/tags/${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-macos
+      - name: Version from the tag
+        run: sed -i '' "1,/^version = \".*\"/s//version = \"${TAG#v}\"/" Cargo.toml
+      - name: Build
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: cargo build --release -p pocketgpu --target aarch64-apple-darwin
+      - name: Package
+        run: tar -czf pocketgpu-aarch64-macos.tar.gz -C target/aarch64-apple-darwin/release pocketgpu
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-macos
+          path: pocketgpu-aarch64-macos.tar.gz
+
+  # The tray app and agent window (F22) as a per-user installer.
+  tray:
+    name: Build tray app (Windows)
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: refs/tags/${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-tray
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Install UI and Tauri CLI
+        shell: bash
+        run: npm ci --prefix app && npm ci --prefix desktop
+      # The installer carries the agent; the tray app installs it on first launch.
+      - name: Version from the tag
+        shell: bash
+        run: sed -i "0,/^version = \".*\"/s//version = \"${TAG#v}\"/" Cargo.toml
+      - name: Build the agent to bundle
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release -p pocketgpu --target x86_64-pc-windows-msvc
+          mkdir -p desktop/src-tauri/resources
+          cp target/x86_64-pc-windows-msvc/release/pocketgpu.exe desktop/src-tauri/resources/
+      - name: Build installer
+        shell: bash
+        working-directory: desktop
+        run: |
+          v="${TAG#v}"
+          printf '{"version":"%s","bundle":{"resources":{"resources/pocketgpu.exe":"pocketgpu.exe"}}}' "${v%%-*}" > release.json
+          npx tauri build --bundles nsis --config release.json
+          cp ../target/release/bundle/nsis/*-setup.exe ../PocketGPU-Agent-x86_64-setup.exe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-tray
+          path: PocketGPU-Agent-x86_64-setup.exe
+
+  # The desktop client (F31): the phone app built for PCs and laptops. An unsigned beta, so
+  # a failed client build never holds back the agent release.
+  client:
+    name: Build desktop client (${{ matrix.os }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis
+          - os: ubuntu-22.04
+            bundles: deb,appimage
+          - os: macos-latest
+            bundles: dmg
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: refs/tags/${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-client
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
+      - name: Install UI and Tauri CLI
+        shell: bash
+        run: npm ci --prefix app
+      - name: Version from the tag
+        shell: bash
+        run: |
+          v="${TAG#v}"
+          sed -i.bak "0,/^version = \".*\"/s//version = \"$v\"/" Cargo.toml 2>/dev/null \
+            || sed -i.bak "1,/^version = \".*\"/s//version = \"$v\"/" Cargo.toml
+          printf '{"version":"%s"}' "${v%%-*}" > app/release.json
+      - name: Build
+        shell: bash
+        working-directory: app
+        run: npx tauri build --bundles ${{ matrix.bundles }} --config release.json
+      - name: Collect
+        shell: bash
+        run: |
+          b=target/release/bundle
+          case "$RUNNER_OS" in
+            Windows) cp $b/nsis/*-setup.exe PocketGPU-x86_64-setup.exe ;;
+            Linux)
+              cp $b/deb/*.deb PocketGPU-amd64.deb
+              cp $b/appimage/*.AppImage PocketGPU-x86_64.AppImage ;;
+            macOS) cp $b/dmg/*.dmg PocketGPU-aarch64.dmg ;;
+          esac
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-client-${{ runner.os }}
+          path: |
+            PocketGPU-x86_64-setup.exe
+            PocketGPU-amd64.deb
+            PocketGPU-x86_64.AppImage
+            PocketGPU-aarch64.dmg
+          if-no-files-found: ignore
+
+  release:
+    needs: [build, windows, macos, tray, client]
+    # The client is a beta: publish when the agent builds pass, whatever the client did.
+    # `!cancelled()` rather than `always()`: cancelling a run must stop it signing and
+    # publishing.
+    if: >-
+      !cancelled() && needs.build.result == 'success' && needs.windows.result == 'success' &&
+      needs.macos.result == 'success' && needs.tray.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: agent-*
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          shopt -s nullglob
+          sha256sum pocketgpu-*.tar.gz PocketGPU-* > SHA256SUMS && cat SHA256SUMS
+      - name: Sign checksums
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m SHA256SUMS
+          rm minisign.key
+      # GitHub's own CLI rather than a third-party action, which would see the token. The tag
+      # is created here, on this repository's default branch.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'NOTES'
+          Install: `curl -fsSL https://pocketgpu.app/install | sh` (Linux, Apple silicon Macs) or
+          `irm https://pocketgpu.app/install.ps1 | iex` (Windows). Update: `pgpu update`.
+          Desktop client (beta, unsigned): `PocketGPU-x86_64-setup.exe` for Windows (SmartScreen:
+          More info → Run anyway), `.deb` or `.AppImage` for Linux, `.dmg` for Apple silicon
+          Macs (then `xattr -dr com.apple.quarantine /Applications/PocketGPU.app`).
+          Files are listed in SHA256SUMS, signed with minisign (SHA256SUMS.minisig).
+          NOTES
+          pre=""
+          case "$TAG" in *-*) pre="--prerelease" ;; esac
+          shopt -s nullglob
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "PocketGPU $TAG" --notes-file notes.md $pre \
+            pocketgpu-*.tar.gz PocketGPU-* SHA256SUMS SHA256SUMS.minisig
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: refs/tags/${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: agent-*
+          merge-multiple: true
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/pocketgpu/pocketgpu
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=raw,value=latest,enable=${{ !contains(env.TAG, '-') }}
+      - id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/agent.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign the image
+        run: cosign sign --yes ghcr.io/pocketgpu/pocketgpu@${{ steps.push.outputs.digest }}
