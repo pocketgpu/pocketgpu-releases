@@ -62,10 +62,20 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      # Kept even when a later step fails, so a failed upload doesn't mean a cold rebuild.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: android
+          cache-on-failure: true
+      # Gradle's own downloads (the Android build tools and libraries).
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('app/package-lock.json') }}
+          restore-keys: gradle-${{ runner.os }}-
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -135,7 +145,9 @@ jobs:
           export PGPU_KEYSTORE_FILE="$RUNNER_TEMP/upload.jks"
           export PGPU_KEY_PASSWORD="${KEY_PASSWORD:-$PGPU_KEYSTORE_PASSWORD}"
           printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$PGPU_KEYSTORE_FILE"
-          npx tauri android build --aab --ci
+          # ARM only: practically every Android phone. The x86 builds are for emulators and a few
+          # Chromebooks, and would double the Rust build time.
+          npx tauri android build --aab --ci --target aarch64 --target armv7
           rm -f "$PGPU_KEYSTORE_FILE"
           aab=$(find src-tauri/gen/android/app/build/outputs/bundle -name '*.aab' | head -1)
           [ -n "$aab" ] || { echo "no .aab was built"; exit 1; }
