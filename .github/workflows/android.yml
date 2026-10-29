@@ -1,0 +1,184 @@
+name: Android
+
+# Builds the signed Android App Bundle of the phone app from the private code repository
+# pocketgpu/pocketgpu and uploads it straight to Google Play. It runs here because a public
+# repository's runners cost no Actions minutes. The source of this file is
+# .github/releases-repo/android.yml in the code repository; copy changes here.
+#
+# Start it with Actions → Android → Run workflow. The version comes from
+# app/src-tauri/tauri.conf.json at the chosen ref (Google Play needs a higher one each upload).
+# Nothing is kept as a run artifact: the bundle goes to Google Play and nowhere else.
+# Needs, in this repository's settings:
+#   secrets   SOURCE_TOKEN                fine-grained token, Contents: read on pocketgpu/pocketgpu
+#             ANDROID_KEYSTORE_BASE64     the upload keystore (.jks), base64-encoded
+#             ANDROID_KEYSTORE_PASSWORD
+#             ANDROID_KEY_PASSWORD        only if the key's password differs from the keystore's
+#             GOOGLE_SERVICES_JSON        google-services.json from Firebase (push)
+#             PLAY_SERVICE_ACCOUNT_JSON   a Google Cloud service account key with release access
+#                                         to the app in Play Console (Users and permissions)
+#   variables ANDROID_KEY_ALIAS (default: upload), PGPU_DEFAULT_RELAYS, PGPU_PUSH_URL
+# Run logs are public: nothing here may print a secret or the source.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit in pocketgpu/pocketgpu
+        required: true
+        default: main
+      track:
+        description: Google Play track
+        required: true
+        default: internal
+        type: choice
+        options: [internal, alpha, beta, production]
+      notes:
+        description: Release notes (en-US)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android
+
+env:
+  CARGO_TERM_COLOR: always
+  PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
+  PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
+  PACKAGE: app.pocketgpu
+  # The plugin that reads google-services.json; the version the app was first built with.
+  GOOGLE_SERVICES_PLUGIN: com.google.gms:google-services:4.4.2
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: android
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Version
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          v=$(node -p "require('./app/src-tauri/tauri.conf.json').version")
+          echo "Building app version $v from $REF"
+          echo "APP_VERSION=$v" >> "$GITHUB_ENV"
+      - name: Install UI and Tauri CLI
+        run: npm ci --prefix app
+      # The runner has the Android SDK and NDK; the Android project is generated, not committed.
+      - name: Generate the Android project
+        working-directory: app
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          npx tauri android init --ci
+          cp -r src-tauri/icons/android/. src-tauri/gen/android/app/src/main/res/
+      # Signing and Firebase on top of the template; each edit fails loudly if the template moved.
+      - name: Add signing and Firebase
+        working-directory: app/src-tauri/gen/android
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_SERVICES_JSON" > app/google-services.json
+          python3 - <<'PY'
+          import os, pathlib, sys
+
+          def edit(path, old, new):
+              p = pathlib.Path(path)
+              text = p.read_text()
+              if text.count(old) != 1:
+                  sys.exit(f"{path}: expected one {old.strip()!r}; the Tauri template changed")
+              p.write_text(text.replace(old, new))
+
+          plugin = os.environ["GOOGLE_SERVICES_PLUGIN"]
+          edit("build.gradle.kts",
+               '        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:',
+               f'        classpath("{plugin}")\n'
+               '        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:')
+          edit("app/build.gradle.kts", "    buildTypes {\n",
+               '    signingConfigs {\n'
+               '        create("release") {\n'
+               '            storeFile = file(System.getenv("PGPU_KEYSTORE_FILE"))\n'
+               '            storePassword = System.getenv("PGPU_KEYSTORE_PASSWORD")\n'
+               '            keyAlias = System.getenv("PGPU_KEY_ALIAS")\n'
+               '            keyPassword = System.getenv("PGPU_KEY_PASSWORD")\n'
+               '        }\n'
+               '    }\n'
+               '    buildTypes {\n')
+          edit("app/build.gradle.kts", '        getByName("release") {\n',
+               '        getByName("release") {\n'
+               '            signingConfig = signingConfigs.getByName("release")\n')
+          app = pathlib.Path("app/build.gradle.kts")
+          app.write_text(app.read_text() + '\napply(plugin = "com.google.gms.google-services")\n')
+          PY
+      - name: Build the bundle
+        working-directory: app
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          PGPU_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PGPU_KEY_ALIAS: ${{ vars.ANDROID_KEY_ALIAS || 'upload' }}
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          export PGPU_KEYSTORE_FILE="$RUNNER_TEMP/upload.jks"
+          export PGPU_KEY_PASSWORD="${KEY_PASSWORD:-$PGPU_KEYSTORE_PASSWORD}"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$PGPU_KEYSTORE_FILE"
+          npx tauri android build --aab --ci
+          rm -f "$PGPU_KEYSTORE_FILE"
+          aab=$(find src-tauri/gen/android/app/build/outputs/bundle -name '*.aab' | head -1)
+          [ -n "$aab" ] || { echo "no .aab was built"; exit 1; }
+          echo "AAB=$PWD/$aab" >> "$GITHUB_ENV"
+          ls -l "$aab"
+      # Google's own API through its auth library, rather than a third-party action, which
+      # would see the service account key.
+      - name: Upload to Google Play
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          TRACK: ${{ inputs.track }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          pip install --quiet google-auth==2.40.3 requests==2.32.4
+          python3 - <<'PY'
+          import json, os
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession
+
+          creds = service_account.Credentials.from_service_account_info(
+              json.loads(os.environ["PLAY_SERVICE_ACCOUNT_JSON"]),
+              scopes=["https://www.googleapis.com/auth/androidpublisher"])
+          s = AuthorizedSession(creds)
+          pkg, track = os.environ["PACKAGE"], os.environ["TRACK"]
+          api = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{pkg}"
+          upload = f"https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/{pkg}"
+
+          def check(r, what):
+              if not r.ok:
+                  raise SystemExit(f"{what} failed: {r.status_code} {r.text}")
+              return r.json()
+
+          edit = check(s.post(f"{api}/edits"), "Opening an edit")["id"]
+          with open(os.environ["AAB"], "rb") as f:
+              code = check(s.post(f"{upload}/edits/{edit}/bundles?uploadType=media", data=f,
+                                  headers={"Content-Type": "application/octet-stream"},
+                                  timeout=900), "Uploading the bundle")["versionCode"]
+          release = {"name": os.environ["APP_VERSION"], "versionCodes": [str(code)],
+                     "status": "completed"}
+          if os.environ.get("NOTES"):
+              release["releaseNotes"] = [{"language": "en-US", "text": os.environ["NOTES"]}]
+          check(s.put(f"{api}/edits/{edit}/tracks/{track}",
+                      json={"track": track, "releases": [release]}), "Setting the track")
+          check(s.post(f"{api}/edits/{edit}:commit"), "Committing")
+          print(f"Uploaded {os.environ['APP_VERSION']} (version code {code}) to {track}")
+          PY
