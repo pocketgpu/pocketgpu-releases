@@ -10,6 +10,9 @@ name: Android
 # Run workflow. The version is the `version` input, or else app/src-tauri/tauri.conf.json at
 # the chosen ref (Google Play needs a higher one each upload).
 # Nothing is kept as a run artifact: the bundle goes to Google Play and nowhere else.
+# Before beta and production, the app is also opened in an emulator first (job `check`, the
+# same check CI runs: .github/android/ in the code repository); the upload waits for it and
+# nothing reaches Google Play if the app crashes or closes by itself.
 # Needs, in this repository's settings:
 #   secrets   SOURCE_TOKEN                fine-grained token, Contents: read on pocketgpu/pocketgpu
 #             ANDROID_KEYSTORE_BASE64     the upload keystore (.jks), base64-encoded
@@ -47,6 +50,8 @@ on:
 
 permissions:
   contents: read
+  # The upload reads whether the app check passed.
+  actions: read
 
 concurrency:
   group: android
@@ -60,6 +65,29 @@ env:
   GOOGLE_SERVICES_PLUGIN: com.google.gms:google-services:4.4.2
 
 jobs:
+  # Beside the bundle build, so it adds little time: the app opened in an emulator must stay
+  # open for 30 seconds with no crash in its log. Nothing from it is kept (logs are public).
+  check:
+    name: App check
+    if: inputs.track == 'beta' || inputs.track == 'production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - name: Code without the app check
+        if: hashFiles('.github/android/action.yml') == ''
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          echo "::error::$REF is older than the app check, so it can't go to beta or production from here. Release it to alpha and promote it in Play Console, or release a newer commit."
+          exit 1
+      - uses: ./.github/android
+
   bundle:
     runs-on: ubuntu-latest
     steps:
@@ -167,6 +195,23 @@ jobs:
           [ -n "$aab" ] || { echo "no .aab was built"; exit 1; }
           echo "AAB=$PWD/$aab" >> "$GITHUB_ENV"
           ls -l "$aab"
+      - name: Wait for the app check
+        if: inputs.track == 'beta' || inputs.track == 'production'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The latest try of each job, so a re-run of a failed upload sees the check that passed.
+          jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest"
+          for _ in $(seq 270); do
+            job=$(gh api "$jobs" --jq '.jobs[] | select(.name == "App check") | "\(.status) \(.conclusion)"')
+            case "$job" in
+              "completed success") echo "The app opened and stayed open: uploading"; exit 0 ;;
+              completed*) echo "::error::The app check failed (see the App check job): nothing was uploaded to Google Play"; exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "::error::The app check didn't finish in 90 minutes: nothing was uploaded"
+          exit 1
       # Google's own API through its auth library, rather than a third-party action, which
       # would see the service account key.
       - name: Upload to Google Play
