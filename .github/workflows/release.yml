@@ -199,13 +199,18 @@ jobs:
         run: npm ci --prefix app
       - name: Version from the tag
         shell: bash
+        env:
+          HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && 'yes' || '' }}
         run: |
           v="${TAG#v}"
           perl -0pi -e 's/^version = ".*"/version = "'"$v"'"/m' Cargo.toml
           if [ "$RUNNER_OS" = Windows ]; then
             # The Windows app carries the agent and installs it for the user (F34). Not next to
             # PocketGPU.exe: Windows names are case-insensitive, so it would replace the app.
-            printf '{"version":"%s","bundle":{"resources":{"resources/pocketgpu.exe":"agent/pocketgpu.exe"}}}' "${v%%-*}" > app/release.json
+            # With the release key, the installer is signed for the app's own updates (board 29).
+            updater=false
+            [ -n "$HAS_UPDATER_KEY" ] && updater=true
+            printf '{"version":"%s","bundle":{"createUpdaterArtifacts":%s,"resources":{"resources/pocketgpu.exe":"agent/pocketgpu.exe"}}}' "${v%%-*}" "$updater" > app/release.json
           else
             printf '{"version":"%s"}' "${v%%-*}" > app/release.json
           fi
@@ -221,13 +226,21 @@ jobs:
       - name: Build
         shell: bash
         working-directory: app
+        env:
+          # The desktop app's updates (board 29): the private key signs, the public half is
+          # built into the app. Without them the app simply never offers updates.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          PGPU_UPDATER_PUBKEY: ${{ vars.PGPU_UPDATER_PUBKEY }}
         run: npx tauri build --bundles ${{ matrix.bundles }} --config release.json
       - name: Collect
         shell: bash
         run: |
           b=target/release/bundle
           case "$RUNNER_OS" in
-            Windows) cp $b/nsis/*-setup.exe PocketGPU-x86_64-setup.exe ;;
+            Windows)
+              cp $b/nsis/*-setup.exe PocketGPU-x86_64-setup.exe
+              for f in $b/nsis/*-setup.exe.sig; do [ -f "$f" ] && cp "$f" PocketGPU-x86_64-setup.exe.sig; done ;;
             Linux)
               cp $b/deb/*.deb PocketGPU-amd64.deb
               cp $b/appimage/*.AppImage PocketGPU-x86_64.AppImage ;;
@@ -238,6 +251,7 @@ jobs:
           name: agent-client-${{ runner.os }}
           path: |
             PocketGPU-x86_64-setup.exe
+            PocketGPU-x86_64-setup.exe.sig
             PocketGPU-amd64.deb
             PocketGPU-x86_64.AppImage
             PocketGPU-aarch64.dmg
@@ -258,6 +272,19 @@ jobs:
         with:
           pattern: agent-*
           merge-multiple: true
+      # The desktop app's update manifest (board 29), when the Windows installer was signed.
+      - name: latest.json
+        run: |
+          if [ -f PocketGPU-x86_64-setup.exe.sig ]; then
+            v="${TAG#v}"
+            jq -n --arg v "${v%%-*}" --arg sig "$(cat PocketGPU-x86_64-setup.exe.sig)" \
+              --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/PocketGPU-x86_64-setup.exe" \
+              --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{version: $v, notes: "See the release notes on GitHub.", pub_date: $date,
+                platforms: {"windows-x86_64": {signature: $sig, url: $url}}}' > latest.json
+            rm PocketGPU-x86_64-setup.exe.sig
+            cat latest.json
+          fi
       - name: Checksums
         run: |
           shopt -s nullglob
@@ -292,7 +319,7 @@ jobs:
           shopt -s nullglob
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
             --title "PocketGPU $TAG" --notes-file notes.md $pre \
-            pocketgpu-*.tar.gz PocketGPU-* SHA256SUMS SHA256SUMS.minisig
+            pocketgpu-*.tar.gz PocketGPU-* SHA256SUMS SHA256SUMS.minisig latest*.json
 
   docker:
     needs: build
