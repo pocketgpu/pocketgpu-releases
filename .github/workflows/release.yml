@@ -201,6 +201,7 @@ jobs:
         shell: bash
         env:
           HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && 'yes' || '' }}
+          PGPU_UPDATER_PUBKEY: ${{ vars.PGPU_UPDATER_PUBKEY }}
         run: |
           v="${TAG#v}"
           perl -0pi -e 's/^version = ".*"/version = "'"$v"'"/m' Cargo.toml
@@ -208,9 +209,16 @@ jobs:
             # The Windows app carries the agent and installs it for the user (F34). Not next to
             # PocketGPU.exe: Windows names are case-insensitive, so it would replace the app.
             # With the release key, the installer is signed for the app's own updates (board 29).
+            # The bundler checks the signature against plugins.updater.pubkey, so the public key
+            # goes into the build's config as well as into the app (PGPU_UPDATER_PUBKEY).
             updater=false
-            [ -n "$HAS_UPDATER_KEY" ] && updater=true
-            printf '{"version":"%s","bundle":{"createUpdaterArtifacts":%s,"resources":{"resources/pocketgpu.exe":"agent/pocketgpu.exe"}}}' "${v%%-*}" "$updater" > app/release.json
+            if [ -n "$HAS_UPDATER_KEY" ] && [ -n "$PGPU_UPDATER_PUBKEY" ]; then updater=true; fi
+            jq -n --arg v "${v%%-*}" --argjson updater "$updater" --arg key "$PGPU_UPDATER_PUBKEY" \
+              '{version: $v,
+                bundle: {createUpdaterArtifacts: $updater,
+                         resources: {"resources/pocketgpu.exe": "agent/pocketgpu.exe"}}}
+               + (if $updater then {plugins: {updater: {pubkey: $key}}} else {} end)' > app/release.json
+            cat app/release.json
           else
             printf '{"version":"%s"}' "${v%%-*}" > app/release.json
           fi
