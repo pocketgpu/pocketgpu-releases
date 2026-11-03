@@ -157,55 +157,10 @@ jobs:
           name: agent-macos
           path: pocketgpu-aarch64-macos.tar.gz
 
-  # The tray app and agent window (F22) as a per-user installer.
-  tray:
-    name: Build tray app (Windows)
-    needs: version
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: pocketgpu/pocketgpu
-          ref: refs/tags/${{ env.TAG }}
-          token: ${{ secrets.SOURCE_TOKEN }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: release-tray
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-      - name: Install UI and Tauri CLI
-        shell: bash
-        run: npm ci --prefix app && npm ci --prefix desktop
-      # The installer carries the agent; the tray app installs it on first launch.
-      - name: Version from the tag
-        shell: bash
-        run: sed -i "0,/^version = \".*\"/s//version = \"${TAG#v}\"/" Cargo.toml
-      - name: Build the agent to bundle
-        shell: bash
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
-        run: |
-          cargo build --release -p pocketgpu --target x86_64-pc-windows-msvc
-          mkdir -p desktop/src-tauri/resources
-          cp target/x86_64-pc-windows-msvc/release/pocketgpu.exe desktop/src-tauri/resources/
-      - name: Build installer
-        shell: bash
-        working-directory: desktop
-        run: |
-          v="${TAG#v}"
-          printf '{"version":"%s","bundle":{"resources":{"resources/pocketgpu.exe":"pocketgpu.exe"}}}' "${v%%-*}" > release.json
-          npx tauri build --bundles nsis --config release.json
-          cp ../target/release/bundle/nsis/*-setup.exe ../PocketGPU-Agent-x86_64-setup.exe
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: agent-tray
-          path: PocketGPU-Agent-x86_64-setup.exe
-
-  # The desktop client (F31): the phone app built for PCs and laptops. An unsigned beta, so
-  # a failed client build never holds back the agent release.
+  # The desktop app (F31, F34): the phone app built for PCs and laptops. On Windows it is the
+  # one PocketGPU app, with This PC (the old tray app and agent window) and the agent inside,
+  # which it installs for the user. An unsigned beta, so a failed build never holds back the
+  # agent release.
   client:
     name: Build desktop client (${{ matrix.os }})
     needs: version
@@ -247,7 +202,22 @@ jobs:
         run: |
           v="${TAG#v}"
           perl -0pi -e 's/^version = ".*"/version = "'"$v"'"/m' Cargo.toml
-          printf '{"version":"%s"}' "${v%%-*}" > app/release.json
+          if [ "$RUNNER_OS" = Windows ]; then
+            # The Windows app carries the agent and installs it for the user (F34). Not next to
+            # PocketGPU.exe: Windows names are case-insensitive, so it would replace the app.
+            printf '{"version":"%s","bundle":{"resources":{"resources/pocketgpu.exe":"agent/pocketgpu.exe"}}}' "${v%%-*}" > app/release.json
+          else
+            printf '{"version":"%s"}' "${v%%-*}" > app/release.json
+          fi
+      - name: Build the agent to bundle
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release -p pocketgpu --target x86_64-pc-windows-msvc
+          mkdir -p app/src-tauri/resources
+          cp target/x86_64-pc-windows-msvc/release/pocketgpu.exe app/src-tauri/resources/
       - name: Build
         shell: bash
         working-directory: app
@@ -274,13 +244,12 @@ jobs:
           if-no-files-found: ignore
 
   release:
-    needs: [build, windows, macos, tray, client]
+    needs: [build, windows, macos, client]
     # The client is a beta, and the macOS agent is not tried on a real Mac yet: publish when
     # the Linux and Windows builds pass, whatever those did. `!cancelled()` rather than
     # `always()`: cancelling a run must stop it signing and publishing.
     if: >-
-      !cancelled() && needs.build.result == 'success' && needs.windows.result == 'success' &&
-      needs.tray.result == 'success'
+      !cancelled() && needs.build.result == 'success' && needs.windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -311,9 +280,11 @@ jobs:
           cat > notes.md <<'NOTES'
           Install: `curl -fsSL https://pocketgpu.app/install | sh` (Linux, Apple silicon Macs) or
           `irm https://pocketgpu.app/install.ps1 | iex` (Windows). Update: `pgpu update`.
-          Desktop client (beta, unsigned): `PocketGPU-x86_64-setup.exe` for Windows (SmartScreen:
-          More info → Run anyway), `.deb` or `.AppImage` for Linux, `.dmg` for Apple silicon
-          Macs (then `xattr -dr com.apple.quarantine /Applications/PocketGPU.app`).
+          Windows: one app, `PocketGPU-x86_64-setup.exe` (beta, unsigned; SmartScreen: More info →
+          Run anyway). It watches your machines like the phone and can share this PC's GPU, and
+          it replaces the older "PocketGPU Agent" app and desktop client: run it once over them,
+          and phones stay paired. Desktop app for Linux (`.deb`, `.AppImage`) and Apple silicon
+          Macs (`.dmg`, then `xattr -dr com.apple.quarantine /Applications/PocketGPU.app`).
           Files are listed in SHA256SUMS, signed with minisign (SHA256SUMS.minisig).
           NOTES
           pre=""
