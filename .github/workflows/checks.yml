@@ -166,7 +166,7 @@ jobs:
       # touching this file.
       - name: Drive the app (not yet counted)
         continue-on-error: true
-        timeout-minutes: 25
+        timeout-minutes: 28
         run: |
           app=$(find app/src-tauri/gen/apple/build -name '*.app' -not -path '*.appex/*' | head -n1)
           bash .github/ios/e2e.sh "$app"
