@@ -10,7 +10,7 @@ name: Checks
 #   ios-smoke      the unsigned simulator build opened in an iPhone simulator: it must stay up
 #                  30 seconds without a crash report (.github/ios/smoke.sh), then driven with
 #                  Appium against an agent on the Mac through the same steps as android-e2e
-#                  (.github/ios/e2e.sh, app/e2e/ios.mjs; not yet counted)
+#                  (.github/ios/e2e.sh, app/e2e/ios.mjs)
 #   android-e2e    the debug app in an emulator against a Linux agent on the runner (fake GPU,
 #                  fake power commands): pairing, live stats, a second device's notice and
 #                  revoke, power off by default and a restart cancelled at the computer
@@ -182,12 +182,25 @@ jobs:
           key: ${{ steps.ios-app.outputs.cache-primary-key }}
       - name: Open it in a simulator
         run: sh .github/ios/smoke.sh ios-app/PocketGPU.app
+      # The agent and stand-in phone the e2e check builds, and the driver's test runner, kept
+      # between runs: together about 4 minutes of building (.github/ios/e2e.sh).
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: e2e-target
+          key: ios-e2e-target-${{ hashFiles('Cargo.lock', 'crates/**') }}
+          restore-keys: ios-e2e-target-
+      # A test runner built with another Xcode may not start: the version is part of its key.
+      - id: xcode
+        run: echo "version=$(xcodebuild -version | head -n1 | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/wda
+          key: wda-${{ steps.xcode.outputs.version }}-${{ hashFiles('.github/ios/e2e.sh') }}
       # Appium drives the app against an agent on this Mac (.github/ios/e2e.sh): pairing, live
       # stats, a second device revoked, power off by default and a restart cancelled. The
       # scripts come from the code that was checked out, so they change without touching this
-      # file. Not counted until it has passed here.
-      - name: Drive the app (not yet counted)
-        continue-on-error: true
+      # file.
+      - name: Drive the app
         timeout-minutes: 28
         run: bash .github/ios/e2e.sh ios-app/PocketGPU.app
       - name: Send the screens and video to the admin page
