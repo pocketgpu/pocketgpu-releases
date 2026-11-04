@@ -16,8 +16,9 @@ name: Checks
 #
 # Nightly on main, and by hand on any branch or commit (Actions → Checks → Run workflow).
 # Needs the secret SOURCE_TOKEN (fine-grained token, Contents: read on pocketgpu/pocketgpu).
-# Run logs are public: nothing here uploads artifacts or prints secrets; the e2e check keeps
-# its screenshots and logs on the runner, and every build and test runs through
+# Run logs are public: nothing here uploads GitHub artifacts or prints secrets; the e2e check keeps
+# its screenshots and logs on the runner except the screens and videos it sends to the push
+# server for the admin page (.github/media-upload.sh, secret PUSH_CHECKS_TOKEN, optional), and every build and test runs through
 # .github/quiet.sh (PGPU_QUIET), which prints pass or fail and an error's headlines but never
 # the lines of code a compiler error quotes. Started and read from the admin page's Checks.
 run-name: Checks · ${{ inputs.ref || 'main (nightly)' }}
@@ -108,6 +109,13 @@ jobs:
       - uses: ./.github/android
         with:
           script: sh app/e2e/run.sh "$APK"
+      # The test's screens and video, for the admin page's run view (push server, 14 days).
+      - name: Send the screens and video to the admin page
+        if: always()
+        env:
+          PGPU_CHECKS_URL: ${{ vars.PGPU_PUSH_URL }}
+          PGPU_CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
+        run: sh .github/media-upload.sh android e2e-out
 
   ios-smoke:
     runs-on: macos-15
@@ -151,3 +159,9 @@ jobs:
           app=$(find app/src-tauri/gen/apple/build -name '*.app' -not -path '*.appex/*' | head -n1)
           [ -n "$app" ] || { echo "::error::no .app was built"; exit 1; }
           sh .github/ios/smoke.sh "$app"
+      - name: Send the screens and video to the admin page
+        if: always()
+        env:
+          PGPU_CHECKS_URL: ${{ vars.PGPU_PUSH_URL }}
+          PGPU_CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
+        run: sh .github/media-upload.sh ios e2e-out
