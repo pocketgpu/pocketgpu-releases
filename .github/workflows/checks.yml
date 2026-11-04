@@ -9,7 +9,8 @@ name: Checks
 #   agent-macos    the same on Apple silicon (F26), with the GPU readings printed
 #   ios-smoke      the unsigned simulator build opened in an iPhone simulator: it must stay up
 #                  30 seconds without a crash report (.github/ios/smoke.sh), then driven with
-#                  Appium against an agent on the Mac (.github/ios/e2e.sh, not yet counted)
+#                  Appium against an agent on the Mac through the same steps as android-e2e
+#                  (.github/ios/e2e.sh, app/e2e/ios.mjs; not yet counted)
 #   android-e2e    the debug app in an emulator against a Linux agent on the runner (fake GPU,
 #                  fake power commands): pairing, live stats, a second device's notice and
 #                  revoke, power off by default and a restart cancelled at the computer
@@ -132,6 +133,14 @@ jobs:
           ref: ${{ env.REF }}
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
+      # The built app is kept by the app's code: a run that changes none of it (the e2e check's
+      # own scripts, say) reuses it and skips the long build.
+      - name: Reuse a built iPhone app
+        id: ios-app
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ios-app
+          key: ios-app-e2e-${{ hashFiles('app/src/**', 'app/static/**', 'app/src-tauri/**', 'app/package-lock.json', 'app/*.json', 'app/*.ts', 'app/*.js', 'crates/proto/**', 'crates/client/**', 'Cargo.lock', 'Cargo.toml') }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-ios-sim
@@ -144,32 +153,43 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: app/package-lock.json
-      - run: brew install xcodegen
-      - run: bash ../.github/quiet.sh npm ci
+      - if: steps.ios-app.outputs.cache-hit != 'true'
+        run: brew install xcodegen
+      - if: steps.ios-app.outputs.cache-hit != 'true'
+        run: bash ../.github/quiet.sh npm ci
         working-directory: app
       - name: Generate the Xcode project
+        if: steps.ios-app.outputs.cache-hit != 'true'
         working-directory: app
         run: bash ../.github/quiet.sh npx tauri ios init --ci --skip-targets-install
-      - run: ruby src-tauri/ios/add-widgets.rb
+      - if: steps.ios-app.outputs.cache-hit != 'true'
+        run: ruby src-tauri/ios/add-widgets.rb
         working-directory: app
+      # With the feature `e2e`, the web view can be inspected, which is how Appium reaches the
+      # page; this build is only ever used here.
       - name: Build the simulator app (unsigned)
+        if: steps.ios-app.outputs.cache-hit != 'true'
         working-directory: app
-        run: bash ../.github/quiet.sh npx tauri ios build --ci --no-sign --target aarch64-sim
-      - name: Open it in a simulator
         run: |
-          app=$(find app/src-tauri/gen/apple/build -name '*.app' -not -path '*.appex/*' | head -n1)
+          bash ../.github/quiet.sh npx tauri ios build --ci --no-sign --target aarch64-sim --features e2e
+          app=$(find src-tauri/gen/apple/build -name '*.app' -not -path '*.appex/*' | head -n1)
           [ -n "$app" ] || { echo "::error::no .app was built"; exit 1; }
-          sh .github/ios/smoke.sh "$app"
-      # Appium drives the app against an agent on this Mac (.github/ios/e2e.sh). Still being
-      # built up, so its result is shown in the log and the admin's screens but doesn't fail the
-      # check; the scripts come from the code that was checked out, so they change without
-      # touching this file.
+          mkdir -p ../ios-app && cp -R "$app" ../ios-app/PocketGPU.app
+      - if: steps.ios-app.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ios-app
+          key: ${{ steps.ios-app.outputs.cache-primary-key }}
+      - name: Open it in a simulator
+        run: sh .github/ios/smoke.sh ios-app/PocketGPU.app
+      # Appium drives the app against an agent on this Mac (.github/ios/e2e.sh): pairing, live
+      # stats, a second device revoked, power off by default and a restart cancelled. The
+      # scripts come from the code that was checked out, so they change without touching this
+      # file. Not counted until it has passed here.
       - name: Drive the app (not yet counted)
         continue-on-error: true
         timeout-minutes: 28
-        run: |
-          app=$(find app/src-tauri/gen/apple/build -name '*.app' -not -path '*.appex/*' | head -n1)
-          bash .github/ios/e2e.sh "$app"
+        run: bash .github/ios/e2e.sh ios-app/PocketGPU.app
       - name: Send the screens and video to the admin page
         if: always()
         env:
