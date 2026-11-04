@@ -8,7 +8,8 @@ name: Checks
 #   agent-windows  the agent's clippy and tests on Windows (F21)
 #   agent-macos    the same on Apple silicon (F26), with the GPU readings printed
 #   ios-smoke      the unsigned simulator build opened in an iPhone simulator: it must stay up
-#                  30 seconds without a crash report (.github/ios/smoke.sh)
+#                  30 seconds without a crash report (.github/ios/smoke.sh), then driven with
+#                  Appium against an agent on the Mac (.github/ios/e2e.sh, not yet counted)
 #   android-e2e    the debug app in an emulator against a Linux agent on the runner (fake GPU,
 #                  fake power commands): pairing, live stats, a second device's notice and
 #                  revoke, power off by default and a restart cancelled at the computer
@@ -159,6 +160,16 @@ jobs:
           app=$(find app/src-tauri/gen/apple/build -name '*.app' -not -path '*.appex/*' | head -n1)
           [ -n "$app" ] || { echo "::error::no .app was built"; exit 1; }
           sh .github/ios/smoke.sh "$app"
+      # Appium drives the app against an agent on this Mac (.github/ios/e2e.sh). Still being
+      # built up, so its result is shown in the log and the admin's screens but doesn't fail the
+      # check; the scripts come from the code that was checked out, so they change without
+      # touching this file.
+      - name: Drive the app (not yet counted)
+        continue-on-error: true
+        timeout-minutes: 25
+        run: |
+          app=$(find app/src-tauri/gen/apple/build -name '*.app' -not -path '*.appex/*' | head -n1)
+          bash .github/ios/e2e.sh "$app"
       - name: Send the screens and video to the admin page
         if: always()
         env:
