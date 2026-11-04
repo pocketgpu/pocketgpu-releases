@@ -7,6 +7,8 @@ name: Checks
 #
 #   agent-windows  the agent's clippy and tests on Windows (F21)
 #   agent-macos    the same on Apple silicon (F26), with the GPU readings printed
+#   ios-smoke      the unsigned simulator build opened in an iPhone simulator: it must stay up
+#                  30 seconds without a crash report (.github/ios/smoke.sh)
 #   android-e2e    the debug app in an emulator against a Linux agent on the runner (fake GPU,
 #                  fake power commands): pairing, live stats, a second device's notice and
 #                  revoke, power off by default and a restart cancelled at the computer
@@ -106,3 +108,46 @@ jobs:
       - uses: ./.github/android
         with:
           script: sh app/e2e/run.sh "$APK"
+
+  ios-smoke:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
+      PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> target"
+          key: ios-simulator
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: brew install xcodegen
+      - run: bash ../.github/quiet.sh npm ci
+        working-directory: app
+      - name: Generate the Xcode project
+        working-directory: app
+        run: bash ../.github/quiet.sh npx tauri ios init --ci --skip-targets-install
+      - run: ruby src-tauri/ios/add-widgets.rb
+        working-directory: app
+      - name: Build the simulator app (unsigned)
+        working-directory: app
+        run: bash ../.github/quiet.sh npx tauri ios build --ci --no-sign --target aarch64-sim
+      - name: Open it in a simulator
+        run: |
+          app=$(find app/src-tauri/gen/apple/build -name '*.app' -not -path '*.appex/*' | head -n1)
+          [ -n "$app" ] || { echo "::error::no .app was built"; exit 1; }
+          sh .github/ios/smoke.sh "$app"
