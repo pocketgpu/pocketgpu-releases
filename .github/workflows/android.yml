@@ -58,6 +58,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The emulator check's builds print only headlines here: these logs are public (.github/quiet.sh).
+  PGPU_QUIET: '1'
   PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
   PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
   PACKAGE: app.pocketgpu

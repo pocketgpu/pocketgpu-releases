@@ -1,0 +1,108 @@
+name: Checks
+
+# The expensive checks of the private code repository pocketgpu/pocketgpu, run here because a
+# public repository's runners cost no Actions minutes (Windows and macOS count 2× and 10×
+# there). The source of this file is .github/releases-repo/checks.yml in the code repository,
+# copied here by releases-sync.yml there: edit it there, not here.
+#
+#   agent-windows  the agent's clippy and tests on Windows (F21)
+#   agent-macos    the same on Apple silicon (F26), with the GPU readings printed
+#   android-e2e    the debug app in an emulator against a Linux agent on the runner (fake GPU,
+#                  fake power commands): pairing, live stats, a second device's notice and
+#                  revoke, power off by default and a restart cancelled at the computer
+#                  (app/e2e/android.mjs and .github/android/ in the code repository)
+#
+# Nightly on main, and by hand on any branch or commit (Actions → Checks → Run workflow).
+# Needs the secret SOURCE_TOKEN (fine-grained token, Contents: read on pocketgpu/pocketgpu).
+# Run logs are public: nothing here uploads artifacts or prints secrets; the e2e check keeps
+# its screenshots and logs on the runner, and every build and test runs through
+# .github/quiet.sh (PGPU_QUIET), which prints pass or fail and an error's headlines but never
+# the lines of code a compiler error quotes. Started and read from the admin page's Checks.
+run-name: Checks · ${{ inputs.ref || 'main (nightly)' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit in pocketgpu/pocketgpu
+        required: true
+        default: main
+  schedule:
+    - cron: '23 2 * * *'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  PGPU_QUIET: '1'
+  REF: ${{ inputs.ref || 'main' }}
+
+jobs:
+  agent-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+      - name: Clippy
+        shell: bash
+        run: bash .github/quiet.sh cargo clippy -p pocketgpu -p pocketgpu-proto -p pocketgpu-client --all-targets -- -D warnings
+      - name: Tests
+        shell: bash
+        run: bash .github/quiet.sh cargo nextest run -p pocketgpu -p pocketgpu-proto -p pocketgpu-client --no-tests=pass
+        env:
+          PGPU_FAKE_GPU: "1"
+
+  agent-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+      - name: Clippy
+        shell: bash
+        run: bash .github/quiet.sh cargo clippy -p pocketgpu -p pocketgpu-proto -p pocketgpu-client --all-targets -- -D warnings
+      - name: Tests
+        shell: bash
+        run: bash .github/quiet.sh cargo nextest run -p pocketgpu -p pocketgpu-proto -p pocketgpu-client --no-tests=pass
+        env:
+          PGPU_FAKE_GPU: "1"
+      - name: Apple GPU readings
+        run: bash .github/quiet.sh cargo test -p pocketgpu --lib collect::apple
+
+  android-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      # The agent and the stand-in phone, for the runner itself, in their own folder: the
+      # Android build restores its cache over target/ afterwards.
+      - name: Agent and stand-in phone
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q dbus
+          bash .github/quiet.sh cargo build -p pocketgpu -p pocketgpu-client --bin pocketgpu --example fake_phone --target-dir e2e-target
+      - uses: ./.github/android
+        with:
+          script: sh app/e2e/run.sh "$APK"
