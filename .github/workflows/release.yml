@@ -163,7 +163,9 @@ jobs:
   # agent release.
   client:
     name: Build desktop client (${{ matrix.os }})
-    needs: version
+    # The Windows app bundles the agent the windows job built, the same binary as the
+    # standalone download, rather than compiling it a second time.
+    needs: [version, windows]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -222,15 +224,17 @@ jobs:
           else
             printf '{"version":"%s"}' "${v%%-*}" > app/release.json
           fi
-      - name: Build the agent to bundle
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: runner.os == 'Windows'
+        with:
+          name: agent-windows
+          path: agent-windows
+      - name: The agent to bundle
         if: runner.os == 'Windows'
         shell: bash
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
         run: |
-          cargo build --release -p pocketgpu --target x86_64-pc-windows-msvc
           mkdir -p app/src-tauri/resources
-          cp target/x86_64-pc-windows-msvc/release/pocketgpu.exe app/src-tauri/resources/
+          tar -xzf agent-windows/pocketgpu-x86_64-windows.tar.gz -C app/src-tauri/resources pocketgpu.exe
       - name: Build
         shell: bash
         working-directory: app
