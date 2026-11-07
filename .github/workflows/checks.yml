@@ -1,10 +1,12 @@
 name: Checks
 
-# The expensive checks of the private code repository pocketgpu/pocketgpu, run here because a
-# public repository's runners cost no Actions minutes (Windows and macOS count 2× and 10×
-# there). The source of this file is .github/releases-repo/checks.yml in the code repository,
-# copied here by releases-sync.yml there: edit it there, not here.
+# Every check of the private code repository pocketgpu/pocketgpu, run here because a public
+# repository's runners cost no Actions minutes; the code repository runs no CI of its own. The
+# source of this file is .github/releases-repo/checks.yml in the code repository, copied here
+# by releases-sync.yml there: edit it there, not here.
 #
+#   rust           the whole Rust workspace: cargo fmt, clippy -D warnings and every test
+#   web            the app's UI, the website and the admin page: lint, types and unit tests
 #   agent-windows  the agent's clippy and tests on Windows (F21)
 #   agent-macos    the same on Apple silicon (F26), with the GPU readings printed
 #   ios-smoke      the unsigned simulator build opened in an iPhone simulator: it must stay up
@@ -91,6 +93,102 @@ jobs:
           PGPU_FAKE_GPU: "1"
       - name: Apple GPU readings
         run: bash .github/quiet.sh cargo test -p pocketgpu --lib collect::apple
+
+  # The whole Rust workspace, the Tauri app included (it embeds the built web UI): formatting,
+  # clippy with warnings as errors, and every test.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+      - name: Tauri system libraries
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+      # The lockfiles are written by npm 11; the runner's default npm 10 rejects them.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Build the UI the Tauri crate embeds
+        working-directory: app
+        shell: bash
+        run: |
+          bash ../.github/quiet.sh npm ci
+          bash ../.github/quiet.sh npm run build
+      - name: Format
+        shell: bash
+        run: bash .github/quiet.sh cargo fmt --all -- --check
+      - name: Clippy
+        shell: bash
+        run: bash .github/quiet.sh cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        shell: bash
+        run: bash .github/quiet.sh cargo nextest run --workspace --no-tests=pass
+        env:
+          PGPU_FAKE_GPU: "1"
+
+  # The phone and desktop app's UI, the website and the admin page: formatting and lint, types,
+  # and unit tests.
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            app/package-lock.json
+            web/package-lock.json
+            admin/package-lock.json
+      - name: Install
+        shell: bash
+        run: |
+          for p in app web admin; do
+            (cd "$p" && bash ../.github/quiet.sh npm ci)
+          done
+      # Only the locked version: `npx` would otherwise fetch whatever npm serves.
+      - name: Browser for the app's tests
+        working-directory: app
+        shell: bash
+        run: bash ../.github/quiet.sh npx --no-install playwright install --with-deps chromium
+      - name: App
+        working-directory: app
+        shell: bash
+        run: |
+          bash ../.github/quiet.sh npm run lint
+          bash ../.github/quiet.sh npm run check
+          bash ../.github/quiet.sh npm test
+      - name: Website
+        working-directory: web
+        shell: bash
+        run: |
+          bash ../.github/quiet.sh npm run lint
+          bash ../.github/quiet.sh npm run check
+          bash ../.github/quiet.sh npm test
+      - name: Admin page
+        working-directory: admin
+        shell: bash
+        run: |
+          bash ../.github/quiet.sh npm run lint
+          bash ../.github/quiet.sh npm run check
+          bash ../.github/quiet.sh npm test
 
   android-e2e:
     runs-on: ubuntu-latest
