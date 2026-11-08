@@ -236,6 +236,15 @@ jobs:
         run: |
           mkdir -p app/src-tauri/resources
           tar -xzf agent-windows/pocketgpu-x86_64-windows.tar.gz -C app/src-tauri/resources pocketgpu.exe
+      # The bundler's own downloads (above), kept between releases in Tauri's cache folder, so
+      # once they're there a GitHub hiccup can't stop a release.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/AppData/Local/tauri
+            ~/.cache/tauri
+          key: tauri-tools-${{ runner.os }}-${{ hashFiles('app/package-lock.json') }}
+          restore-keys: tauri-tools-${{ runner.os }}-
       - name: Build
         shell: bash
         working-directory: app
@@ -245,17 +254,17 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           PGPU_UPDATER_PUBKEY: ${{ vars.PGPU_UPDATER_PUBKEY }}
-        # Bundling downloads tools from GitHub (NSIS on Windows, AppRun on Linux), and those
-        # downloads sometimes answer 504 for a few minutes. The app compiles once; a retry only
-        # bundles again. Any other failure stops at once.
+        # Bundling downloads tools from GitHub (NSIS and its plugin on Windows, AppRun on
+        # Linux), and those downloads sometimes answer 504 for a few minutes, so a failed build
+        # tries again, up to four times, a minute more apart each time. It doesn't look for the
+        # error's text: on Windows that never reached the piped output, and v1.2.29 stopped after
+        # one 504. The app compiles once; a retry only bundles again, and a real compile error
+        # fails the same way each time.
         run: |
           for i in 1 2 3 4; do
-            if npx tauri build --bundles ${{ matrix.bundles }} --config release.json 2>&1 | tee build.log; then
-              exit 0
-            fi
-            grep -q "failed to bundle project" build.log || exit 1
+            npx tauri build --bundles ${{ matrix.bundles }} --config release.json && exit 0
             [ "$i" = 4 ] && exit 1
-            echo "::warning::Bundling failed (try $i of 4), most likely a download; again in $((i * 60)) s"
+            echo "::warning::Building the desktop app failed (try $i of 4), most likely a download; again in $((i * 60)) s"
             sleep $((i * 60))
           done
       - name: Collect
