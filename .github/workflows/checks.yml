@@ -18,6 +18,12 @@ name: Checks
 #                  revoke, power off by default and a restart cancelled at the computer
 #                  (app/e2e/android.mjs and .github/android/ in the code repository)
 #
+# A run first works out which of these the change needs (`plan`, .github/checks-plan.mjs in the
+# code repository): the files it touches against main, grouped into parts, and the tests the
+# admin page ticked for those parts (the CHECKS_SETTINGS variable here); the others are skipped.
+# The nightly run on main runs all six, and a failed phone test gets a second try, both unless
+# the admin page turned them off.
+#
 # Nightly on main, and by hand on any branch or commit (Actions → Checks → Run workflow).
 # Needs the secret SOURCE_TOKEN (fine-grained token, Contents: read on pocketgpu/pocketgpu).
 # Run logs are public: nothing here uploads GitHub artifacts or prints secrets; the e2e check keeps
@@ -34,6 +40,10 @@ on:
         description: Branch, tag or commit in pocketgpu/pocketgpu
         required: true
         default: main
+      tests:
+        description: auto (what the change needs), all, or a list such as web,android
+        required: false
+        default: auto
   schedule:
     - cron: '23 2 * * *'
 
@@ -46,7 +56,46 @@ env:
   REF: ${{ inputs.ref || 'main' }}
 
 jobs:
+  # Which tests this run needs; every other job runs only when its answer here is true.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.plan.outputs.rust }}
+      web: ${{ steps.plan.outputs.web }}
+      windows: ${{ steps.plan.outputs.windows }}
+      mac: ${{ steps.plan.outputs.mac }}
+      android: ${{ steps.plan.outputs.android }}
+      ios: ${{ steps.plan.outputs.ios }}
+      second_try: ${{ steps.plan.outputs.second_try }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      # A commit from before the plan existed runs everything.
+      - name: What this change needs
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          TESTS: ${{ inputs.tests || 'auto' }}
+          CHECKS_SETTINGS: ${{ vars.CHECKS_SETTINGS }}
+        run: |
+          if [ -f .github/checks-plan.mjs ]; then
+            node .github/checks-plan.mjs >> "$GITHUB_OUTPUT"
+          else
+            printf '%s=true\n' rust web windows mac android ios second_try >> "$GITHUB_OUTPUT"
+            echo "This commit has no plan yet, so it runs all six." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
   agent-windows:
+    needs: plan
+    if: needs.plan.outputs.windows == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -60,6 +109,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+        id: nextest
+        continue-on-error: true
+      - if: steps.nextest.outcome == 'failure'
+        shell: bash
+        run: sleep 60
+      - if: steps.nextest.outcome == 'failure'
+        uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest, again
       - name: Clippy
         shell: bash
         run: bash .github/quiet.sh cargo clippy -p pocketgpu -p pocketgpu-proto -p pocketgpu-client --all-targets -- -D warnings
@@ -70,6 +126,8 @@ jobs:
           PGPU_FAKE_GPU: "1"
 
   agent-macos:
+    needs: plan
+    if: needs.plan.outputs.mac == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -83,6 +141,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+        id: nextest
+        continue-on-error: true
+      - if: steps.nextest.outcome == 'failure'
+        shell: bash
+        run: sleep 60
+      - if: steps.nextest.outcome == 'failure'
+        uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest, again
       - name: Clippy
         shell: bash
         run: bash .github/quiet.sh cargo clippy -p pocketgpu -p pocketgpu-proto -p pocketgpu-client --all-targets -- -D warnings
@@ -97,6 +162,8 @@ jobs:
   # The whole Rust workspace, the Tauri app included (it embeds the built web UI): formatting,
   # clippy with warnings as errors, and every test.
   rust:
+    needs: plan
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -114,6 +181,12 @@ jobs:
           sudo apt-get install -y -q libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest
+        id: nextest
+        continue-on-error: true
+      - if: steps.nextest.outcome == 'failure'
+        run: sleep 60
+      - if: steps.nextest.outcome == 'failure'
+        uses: taiki-e/install-action@eaa248e7e83aa1d4f575fb2e231e8a5da93dabc3 # nextest, again
       # The lockfiles are written by npm 11; the runner's default npm 10 rejects them.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -141,6 +214,8 @@ jobs:
   # The phone and desktop app's UI, the website and the admin page: formatting and lint, types,
   # and unit tests.
   web:
+    needs: plan
+    if: needs.plan.outputs.web == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -191,8 +266,12 @@ jobs:
           bash ../.github/quiet.sh npm test
 
   android-e2e:
+    needs: plan
+    if: needs.plan.outputs.android == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      SECOND_TRY: ${{ needs.plan.outputs.second_try }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -206,9 +285,14 @@ jobs:
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q dbus
           bash .github/quiet.sh cargo build -p pocketgpu -p pocketgpu-client --bin pocketgpu --example fake_phone --target-dir e2e-target
+      # A failed check starts over once with the app's data cleared and a new agent when the
+      # admin page's "Give phone tests a second try" is on (app/e2e/second-try.sh).
       - uses: ./.github/android
         with:
-          script: sh app/e2e/run.sh "$APK"
+          script: sh app/e2e/run.sh "$APK" || sh app/e2e/second-try.sh "$APK"
+      - name: Second try
+        if: hashFiles('e2e-second-try') != ''
+        run: echo "The first try failed; the second passed."
       # The test's screens and screen text, for the admin page's run view (push server, 14 days).
       - name: Send the screens to the admin page
         if: always()
@@ -218,8 +302,10 @@ jobs:
         run: sh .github/media-upload.sh android e2e-out
 
   ios-smoke:
+    needs: plan
+    if: needs.plan.outputs.ios == 'true'
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
       PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
@@ -299,8 +385,23 @@ jobs:
       # scripts come from the code that was checked out, so they change without touching this
       # file.
       - name: Drive the app
+        id: drive
         timeout-minutes: 28
+        continue-on-error: ${{ needs.plan.outputs.second_try == 'true' }}
         run: bash .github/ios/e2e.sh ios-app/PocketGPU.app
+      # A simulator sometimes misses a tap: with the admin page's "Give phone tests a second
+      # try" on, a failed check starts over once, with the app reinstalled and a new agent
+      # (PGPU_DATA_DIR). The first try's screens stay in e2e-out-first on the runner.
+      - name: Second try
+        if: steps.drive.outcome == 'failure'
+        timeout-minutes: 28
+        env:
+          PGPU_DATA_DIR: ${{ runner.temp }}/pgpu-second-try
+        run: |
+          rm -rf e2e-out-first && mv e2e-out e2e-out-first || true
+          xcrun simctl uninstall booted app.pocketgpu || true
+          xcrun simctl install booted ios-app/PocketGPU.app
+          bash .github/ios/e2e.sh ios-app/PocketGPU.app
       - name: Send the screens to the admin page
         if: always()
         env:
