@@ -159,8 +159,9 @@ jobs:
 
   # The desktop app (F31, F34): the phone app built for PCs and laptops. On Windows it is the
   # one PocketGPU app, with This PC (the old tray app and agent window) and the agent inside,
-  # which it installs for the user. An unsigned beta, so a failed build never holds back the
-  # agent release.
+  # which it installs for the user. The release waits for the Windows build (the website's
+  # download and the app's updates point at it); the Linux and Mac builds are betas and
+  # never hold it back.
   client:
     name: Build desktop client (${{ matrix.os }})
     # The Windows app bundles the agent the windows job built, the same binary as the
@@ -244,7 +245,19 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           PGPU_UPDATER_PUBKEY: ${{ vars.PGPU_UPDATER_PUBKEY }}
-        run: npx tauri build --bundles ${{ matrix.bundles }} --config release.json
+        # Bundling downloads tools from GitHub (NSIS on Windows, AppRun on Linux), and those
+        # downloads sometimes answer 504 for a few minutes. The app compiles once; a retry only
+        # bundles again. Any other failure stops at once.
+        run: |
+          for i in 1 2 3 4; do
+            if npx tauri build --bundles ${{ matrix.bundles }} --config release.json 2>&1 | tee build.log; then
+              exit 0
+            fi
+            grep -q "failed to bundle project" build.log || exit 1
+            [ "$i" = 4 ] && exit 1
+            echo "::warning::Bundling failed (try $i of 4), most likely a download; again in $((i * 60)) s"
+            sleep $((i * 60))
+          done
       - name: Collect
         shell: bash
         run: |
@@ -271,9 +284,10 @@ jobs:
 
   release:
     needs: [build, windows, macos, client]
-    # The client is a beta, and the macOS agent is not tried on a real Mac yet: publish when
-    # the Linux and Windows builds pass, whatever those did. `!cancelled()` rather than
-    # `always()`: cancelling a run must stop it signing and publishing.
+    # The Linux and Mac desktop apps are betas, and the macOS agent is not tried on a real Mac
+    # yet: publish when the Linux and Windows agents pass, whatever those did. The Windows app
+    # is checked below, before anything is published. `!cancelled()` rather than `always()`:
+    # cancelling a run must stop it signing and publishing.
     if: >-
       !cancelled() && needs.build.result == 'success' && needs.windows.result == 'success'
     runs-on: ubuntu-latest
@@ -284,6 +298,16 @@ jobs:
         with:
           pattern: agent-*
           merge-multiple: true
+      # The website's download button and the desktop app's updates (latest.json) point at the
+      # newest release's Windows installer, so a release never goes out without it. When the
+      # Windows app didn't build, nothing is published: rerun the failed jobs, and this job
+      # publishes everything then.
+      - name: The Windows app is there
+        run: |
+          if [ ! -f PocketGPU-x86_64-setup.exe ]; then
+            echo "::error::The Windows app didn't build, so nothing was published. Rerun the failed jobs."
+            exit 1
+          fi
       # The desktop app's update manifest (board 29), when the Windows installer was signed.
       - name: latest.json
         run: |
@@ -329,9 +353,15 @@ jobs:
           pre=""
           case "$TAG" in *-*) pre="--prerelease" ;; esac
           shopt -s nullglob
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --title "PocketGPU $TAG" --notes-file notes.md $pre \
-            pocketgpu-*.tar.gz PocketGPU-* SHA256SUMS SHA256SUMS.minisig latest*.json
+          files=(pocketgpu-*.tar.gz PocketGPU-* SHA256SUMS SHA256SUMS.minisig latest*.json)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # A rerun after a build failed: add what was missing and replace the rest, the
+            # checksums and their signature included.
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "PocketGPU $TAG" --notes-file notes.md $pre "${files[@]}"
+          fi
 
   docker:
     needs: build
@@ -375,6 +405,20 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      # The installer downloads cosign from GitHub, which sometimes answers 504 for a few
+      # minutes: up to three tries, a minute apart, before the image goes unsigned.
+      - id: cosign1
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        continue-on-error: true
+      - if: steps.cosign1.outcome == 'failure'
+        run: sleep 60
+      - id: cosign2
+        if: steps.cosign1.outcome == 'failure'
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        continue-on-error: true
+      - if: steps.cosign1.outcome == 'failure' && steps.cosign2.outcome == 'failure'
+        run: sleep 60
+      - if: steps.cosign1.outcome == 'failure' && steps.cosign2.outcome == 'failure'
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign the image
         run: cosign sign --yes ghcr.io/pocketgpu/pocketgpu@${{ steps.push.outputs.digest }}
