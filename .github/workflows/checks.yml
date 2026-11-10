@@ -324,7 +324,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ios-app
-          key: ios-app-e2e-${{ hashFiles('app/src/**', 'app/static/**', 'app/src-tauri/**', 'app/package-lock.json', 'app/*.json', 'app/*.ts', 'app/*.js', 'crates/proto/**', 'crates/client/**', 'Cargo.lock', 'Cargo.toml') }}
+          key: ios-app-e2e-${{ hashFiles('app/src/**', 'app/static/**', 'app/src-tauri/**', 'app/package-lock.json', 'app/*.json', 'app/*.ts', 'app/*.js', 'crates/proto/**', 'crates/client/**', 'Cargo.lock', 'Cargo.toml', 'patches/**') }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-ios-sim
