@@ -1,0 +1,210 @@
+name: Mac session
+
+# A Mac to use by hand, for testing PocketGPU without owning one: a GitHub-hosted Apple-silicon
+# Mac with the PocketGPU Mac app and, when asked, the agent and the iPhone app in an iPhone
+# Simulator. Its screen is reached from a PC with a VNC viewer over Tailscale. Started by hand
+# (Actions → Mac session → Run workflow, or the admin page's Checks). It stays up for the
+# minutes asked, until ~/STOP or ~/Desktop/STOP appears on the Mac, or until the run is
+# cancelled; GitHub wipes the Mac afterwards. The source of this file is
+# .github/releases-repo/mac-session.yml in the code repository, copied here by releases-sync.yml
+# there: edit it there, not here. Setting it up and connecting: .github/mac/README.md there.
+#
+# Needs, in this repository's settings:
+#   secrets   SOURCE_TOKEN        fine-grained token, Contents: read on pocketgpu/pocketgpu
+#             TS_OAUTH_CLIENT_ID  the client ID and audience of a Tailscale trust credential
+#             TS_AUDIENCE         (OpenID Connect, issuer GitHub, for this workflow on main) with
+#                                 Auth Keys: Write and the tag tag:ci-mac; the Mac joins as an
+#                                 ephemeral node with a GitHub token for this run, and no stored
+#                                 Tailscale secret exists to leak
+#             MAC_VNC_PASSWORD    the screen's password: random, at least 8 characters
+#   variables PGPU_DEFAULT_RELAYS, PGPU_PUSH_URL (built into what is built from a ref)
+# Run logs and summaries are public: nothing here prints a secret or what the app shows, and
+# what is built from the private code runs through .github/quiet.sh and stays on the runner
+# (no GitHub artifacts).
+run-name: Mac session · ${{ inputs.app == 'ref' && inputs.ref || inputs.app == 'release' && inputs.release || 'no Mac app' }}${{ inputs.iphone && ' + iPhone' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'The Mac app: from a release, built from the ref below, or none'
+        type: choice
+        options: [release, ref, none]
+        default: release
+      release:
+        description: 'Release when the app is "release": latest, or a tag like v1.2.30'
+        default: latest
+      ref:
+        description: 'Branch, tag or commit in pocketgpu/pocketgpu: the Mac app when it is "ref", the iPhone app, and the agent unless the app is "release"'
+        default: main
+      agent:
+        description: 'Install the PocketGPU agent on the Mac (from the release when the app is "release", otherwise built from the ref)'
+        type: boolean
+        default: true
+      iphone:
+        description: 'Build the iPhone app from the ref and open it in an iPhone Simulator'
+        type: boolean
+        default: false
+      minutes:
+        description: 'Minutes the session stays up once it is ready (at most 340)'
+        type: number
+        default: 90
+
+permissions:
+  contents: read
+
+# One session at a time: a second start waits until the first ends.
+concurrency:
+  group: mac-session
+  cancel-in-progress: false
+
+env:
+  APP: ${{ inputs.app }}
+  RELEASE: ${{ inputs.release }}
+  REF: ${{ inputs.ref }}
+  AGENT: ${{ inputs.agent }}
+  IPHONE: ${{ inputs.iphone }}
+  MINUTES: ${{ inputs.minutes }}
+  CARGO_TERM_COLOR: never
+  PGPU_QUIET: '1'
+  PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
+  PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
+  CI: 'true'
+
+jobs:
+  session:
+    # The Apple-silicon image the Checks' iPhone job uses, so its built iPhone app fits here.
+    runs-on: macos-15
+    # GitHub's limit for one job. The session ends a quarter of an hour before it
+    # (.github/mac/session.sh), so the Mac still leaves the tailnet properly.
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      # For Tailscale's workload identity: a token from GitHub for this run, not a stored secret.
+      id-token: write
+    steps:
+      - name: The secrets are set
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN != '' }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID != '' }}
+          TS_AUDIENCE: ${{ secrets.TS_AUDIENCE != '' }}
+          MAC_VNC_PASSWORD: ${{ secrets.MAC_VNC_PASSWORD != '' }}
+        run: |
+          missing=$(for s in SOURCE_TOKEN TS_OAUTH_CLIENT_ID TS_AUDIENCE MAC_VNC_PASSWORD; do [ "${!s}" = true ] || printf ' %s' "$s"; done)
+          if [ -n "$missing" ]; then
+            echo "::error::Add these secrets in pocketgpu-releases → Settings → Secrets and variables → Actions:$missing (how: .github/mac/README.md in the code repository)"
+            exit 1
+          fi
+          echo "SESSION_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      # The session's own scripts come from main, so an older ref can still be built and opened.
+      # They move out of the workspace, which the ref's checkout below replaces.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: main
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          path: .session
+          sparse-checkout: |
+            /.github/mac/
+            /.github/quiet.sh
+          sparse-checkout-cone-mode: false
+      - name: What this session needs
+        env:
+          MAC_VNC_PASSWORD: ${{ secrets.MAC_VNC_PASSWORD }}
+        run: |
+          mv .session/.github "$RUNNER_TEMP/session" && rm -rf .session
+          echo "SESSION=$RUNNER_TEMP/session/mac" >> "$GITHUB_ENV"
+          bash "$RUNNER_TEMP/session/mac/session.sh" check
+
+      # The Mac joins the owner's tailnet as an ephemeral node tagged tag:ci-mac, which the
+      # tailnet's rules let only the owner reach; Tailscale removes it when the run ends. It signs
+      # in with workload identity (TS_OAUTH_CLIENT_ID, TS_AUDIENCE): tailscaled keeps the action's
+      # environment, and every later step can read it as root, so no long-lived secret goes in.
+      - uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        timeout-minutes: 20
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci-mac
+          hostname: pocketgpu-mac
+          log-mode: quiet
+      # Screen sharing on port 5900 with MAC_VNC_PASSWORD, and how to connect in the run's
+      # summary: the owner can connect while the rest is built.
+      - name: Screen sharing
+        timeout-minutes: 10
+        env:
+          MAC_VNC_PASSWORD: ${{ secrets.MAC_VNC_PASSWORD }}
+        run: bash "$SESSION/session.sh" screen
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: inputs.app == 'ref' || inputs.iphone || (inputs.agent && inputs.app != 'release')
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      # The iPhone app as the Checks' ios-smoke job builds it, under the same key
+      # (checks.yml): a commit the Checks already built opens here without building, and a
+      # build made here saves the Checks theirs. Keep the two keys the same.
+      - name: Reuse a built iPhone app
+        id: ios-app
+        if: inputs.iphone
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ios-app
+          key: ios-app-e2e-${{ hashFiles('app/src/**', 'app/static/**', 'app/src-tauri/**', 'app/package-lock.json', 'app/*.json', 'app/*.ts', 'app/*.js', 'crates/proto/**', 'crates/client/**', 'Cargo.lock', 'Cargo.toml', 'patches/**') }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: inputs.app == 'ref' || (inputs.agent && inputs.app != 'release') || (inputs.iphone && steps.ios-app.outputs.cache-hit != 'true')
+        with:
+          targets: ${{ inputs.iphone && 'aarch64-apple-ios-sim' || '' }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: inputs.app == 'ref' || (inputs.agent && inputs.app != 'release') || (inputs.iphone && steps.ios-app.outputs.cache-hit != 'true')
+        with:
+          workspaces: ". -> target"
+          key: mac-session
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: inputs.app == 'ref' || (inputs.iphone && steps.ios-app.outputs.cache-hit != 'true')
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Build the Mac app from the ref (unsigned)
+        if: inputs.app == 'ref'
+        timeout-minutes: 60
+        run: bash "$SESSION/build.sh" mac-app
+      - name: Build the agent from the ref
+        if: inputs.agent && inputs.app != 'release'
+        timeout-minutes: 60
+        run: bash "$SESSION/build.sh" agent
+      - name: Build the iPhone app for the Simulator (unsigned)
+        if: inputs.iphone && steps.ios-app.outputs.cache-hit != 'true'
+        timeout-minutes: 60
+        run: bash "$SESSION/build.sh" iphone
+      - if: inputs.iphone && steps.ios-app.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ios-app
+          key: ${{ steps.ios-app.outputs.cache-primary-key }}
+
+      # Setting up has time limits, so a hang ends the run instead of holding a macOS job for 6
+      # hours; only the Session step runs up to the job's limit.
+      - name: Open the Mac app
+        if: inputs.app != 'none'
+        timeout-minutes: 10
+        run: bash "$SESSION/install.sh" app
+      - name: Start the agent
+        if: inputs.agent
+        timeout-minutes: 10
+        run: bash "$SESSION/install.sh" agent
+      - name: Open the iPhone app in a Simulator
+        if: inputs.iphone
+        timeout-minutes: 15
+        run: bash "$SESSION/install.sh" iphone ios-app/PocketGPU.app
+      - name: Ready
+        timeout-minutes: 5
+        run: bash "$SESSION/session.sh" ready
+      # Up until the minutes pass, STOP appears on the Mac, or the run is cancelled.
+      - name: Session
+        run: bash "$SESSION/session.sh" wait

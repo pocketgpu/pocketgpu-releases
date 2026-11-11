@@ -318,7 +318,8 @@ jobs:
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       # The built app is kept by the app's code: a run that changes none of it (the e2e check's
-      # own scripts, say) reuses it and skips the long build.
+      # own scripts, say) reuses it and skips the long build. The Mac session (mac-session.yml,
+      # .github/mac/build.sh) builds the same app under the same key: change them together.
       - name: Reuse a built iPhone app
         id: ios-app
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
