@@ -16,7 +16,8 @@ name: Mac session
 #                                 Auth Keys: Write and the tag tag:ci-mac; the Mac joins as an
 #                                 ephemeral node with a GitHub token for this run, and no stored
 #                                 Tailscale secret exists to leak
-#             MAC_VNC_PASSWORD    the screen's password: random, at least 8 characters
+#             MAC_VNC_PASSWORD    the screen's password: random, at least 16 characters (viewers
+#                                 take the first 8; all of it is the Mac sign-in user's)
 #   variables PGPU_DEFAULT_RELAYS, PGPU_PUSH_URL (built into what is built from a ref)
 # Run logs and summaries are public: nothing here prints a secret or what the app shows, and
 # what is built from the private code runs through .github/quiet.sh and stays on the runner
