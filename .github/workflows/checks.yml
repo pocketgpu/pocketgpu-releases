@@ -441,7 +441,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.macapp == 'true'
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 140
     env:
       PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
       PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
@@ -510,11 +510,12 @@ jobs:
       - name: Prepare the Mac
         timeout-minutes: 15
         run: bash .github/mac-app/prepare.sh mac-app/PocketGPU.app
-      # Opens the app, pairs it by code with an agent on this Mac and waits for live stats,
-      # filmed (e2e-out/mac.mp4).
+      # Opens the app, pairs it by code with an agent on this Mac, waits for live stats, removes
+      # a second device, cancels a restart, saves a file and uses the clipboard, filmed
+      # (e2e-out/mac.mp4).
       - name: Drive the app
         id: drive
-        timeout-minutes: 30
+        timeout-minutes: 38
         continue-on-error: ${{ needs.plan.outputs.second_try == 'true' }}
         run: bash .github/mac-app/e2e.sh mac.mp4
       # With the admin page's second try on, a failed check starts over once, with the app's
@@ -522,7 +523,7 @@ jobs:
       # its screens stay in e2e-out-first on the runner.
       - name: Second try
         if: steps.drive.outcome == 'failure'
-        timeout-minutes: 30
+        timeout-minutes: 38
         env:
           PGPU_DATA_DIR: ${{ runner.temp }}/pgpu-second-try
         run: |
