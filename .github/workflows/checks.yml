@@ -17,17 +17,21 @@ name: Checks
 #                  fake power commands): pairing, live stats, a second device's notice and
 #                  revoke, power off by default and a restart cancelled at the computer
 #                  (app/e2e/android.mjs and .github/android/ in the code repository)
+#   mac-app-e2e    the Mac app (a debug build) on a Mac against an agent on the same Mac, driven
+#                  with Appium's Mac2 driver: the first screen, pairing by code and live stats,
+#                  filmed from start to end (.github/mac-app/, app/e2e/mac.mjs). Nightly and when
+#                  picked (tests: macapp); not for every change unless the admin page ticks it.
 #
 # A run first works out which of these the change needs (`plan`, .github/checks-plan.mjs in the
 # code repository): the files it touches against main, grouped into parts, and the tests the
 # admin page ticked for those parts (the CHECKS_SETTINGS variable here); the others are skipped.
-# The nightly run on main runs all six, and a failed phone test gets a second try, both unless
+# The nightly run on main runs all of them, and a failed app test gets a second try, both unless
 # the admin page turned them off.
 #
 # Nightly on main, and by hand on any branch or commit (Actions → Checks → Run workflow).
 # Needs the secret SOURCE_TOKEN (fine-grained token, Contents: read on pocketgpu/pocketgpu).
 # Run logs are public: nothing here uploads GitHub artifacts or prints secrets; the e2e check keeps
-# its screenshots and logs on the runner except the screens and screen text it sends to the push
+# its screenshots and logs on the runner except the screens, screen text and films it sends to the push
 # server for the admin page (.github/media-upload.sh, secret PUSH_CHECKS_TOKEN, optional), and every build and test runs through
 # .github/quiet.sh (PGPU_QUIET), which prints pass or fail and an error's headlines but never
 # the lines of code a compiler error quotes. Started and read from the admin page's Checks.
@@ -66,6 +70,7 @@ jobs:
       mac: ${{ steps.plan.outputs.mac }}
       android: ${{ steps.plan.outputs.android }}
       ios: ${{ steps.plan.outputs.ios }}
+      macapp: ${{ steps.plan.outputs.macapp }}
       second_try: ${{ steps.plan.outputs.second_try }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -89,8 +94,9 @@ jobs:
           if [ -f .github/checks-plan.mjs ]; then
             node .github/checks-plan.mjs >> "$GITHUB_OUTPUT"
           else
+            # Not the Mac app check: its scripts (.github/mac-app/) came after the plan.
             printf '%s=true\n' rust web windows mac android ios second_try >> "$GITHUB_OUTPUT"
-            echo "This commit has no plan yet, so it runs all six." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "This commit has no plan yet, so it runs all but the Mac app." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
   agent-windows:
@@ -284,6 +290,8 @@ jobs:
       - name: Agent and stand-in phone
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q dbus
+          # ffmpeg joins the film's pieces (.github/android/record.sh).
+          command -v ffmpeg >/dev/null || sudo apt-get install -y -q --no-install-recommends ffmpeg >/dev/null || echo "::warning::no ffmpeg: the film will be its first 3 minutes"
           bash .github/quiet.sh cargo build -p pocketgpu -p pocketgpu-client --bin pocketgpu --example fake_phone --target-dir e2e-target
       # A failed check starts over once with the app's data cleared and a new agent when the
       # admin page's "Give phone tests a second try" is on (app/e2e/second-try.sh).
@@ -293,9 +301,16 @@ jobs:
       - name: Second try
         if: hashFiles('e2e-second-try') != ''
         run: echo "The first try failed; the second passed."
-      # The test's screens and screen text, for the admin page's run view (push server, 14 days).
+      # A film still going (the emulator step timed out) is joined from the pieces it has.
+      - name: Stop the film
+        if: always()
+        timeout-minutes: 5
+        run: bash .github/android/record.sh stop
+      # The test's screens, screen text, films (android.mp4, android-try2.mp4) and their step
+      # times, for the admin page's run view (push server, 14 days).
       - name: Send the screens to the admin page
         if: always()
+        timeout-minutes: 15
         env:
           PGPU_CHECKS_URL: ${{ vars.PGPU_PUSH_URL }}
           PGPU_CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
@@ -382,30 +397,154 @@ jobs:
           path: ${{ runner.temp }}/wda
           key: wda-${{ steps.xcode.outputs.version }}-${{ hashFiles('.github/ios/e2e.sh') }}
       # Appium drives the app against an agent on this Mac (.github/ios/e2e.sh): pairing, live
-      # stats, a second device revoked, power off by default and a restart cancelled. The
-      # scripts come from the code that was checked out, so they change without touching this
-      # file.
+      # stats, a second device revoked, power off by default and a restart cancelled, filmed
+      # (e2e-out/ios.mp4, .github/ios/record.sh). The scripts come from the code that was
+      # checked out, so they change without touching this file.
       - name: Drive the app
         id: drive
         timeout-minutes: 28
         continue-on-error: ${{ needs.plan.outputs.second_try == 'true' }}
-        run: bash .github/ios/e2e.sh ios-app/PocketGPU.app
+        run: bash .github/ios/e2e.sh ios-app/PocketGPU.app ios.mp4
       # A simulator sometimes misses a tap: with the admin page's "Give phone tests a second
       # try" on, a failed check starts over once, with the app reinstalled and a new agent
-      # (PGPU_DATA_DIR). The first try's screens stay in e2e-out-first on the runner.
+      # (PGPU_DATA_DIR). The first try's film goes with the run; its screens stay in
+      # e2e-out-first on the runner.
       - name: Second try
         if: steps.drive.outcome == 'failure'
         timeout-minutes: 28
         env:
           PGPU_DATA_DIR: ${{ runner.temp }}/pgpu-second-try
         run: |
+          bash .github/ios/record.sh stop
           rm -rf e2e-out-first && mv e2e-out e2e-out-first || true
+          mkdir -p e2e-out
+          cp e2e-out-first/ios.mp4 e2e-out-first/ios-steps.txt e2e-out/ 2>/dev/null || true
           xcrun simctl uninstall booted app.pocketgpu || true
           xcrun simctl install booted ios-app/PocketGPU.app
-          bash .github/ios/e2e.sh ios-app/PocketGPU.app
-      - name: Send the screens to the admin page
+          bash .github/ios/e2e.sh ios-app/PocketGPU.app ios-try2.mp4
+      # A film still running (a step that timed out) is finished here, before it is sent.
+      - name: Stop the film
         if: always()
+        timeout-minutes: 3
+        run: bash .github/ios/record.sh stop
+      - name: Send the screens and the films to the admin page
+        if: always()
+        timeout-minutes: 15
         env:
           PGPU_CHECKS_URL: ${{ vars.PGPU_PUSH_URL }}
           PGPU_CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
         run: sh .github/media-upload.sh ios e2e-out
+
+  # The Mac app on a Mac (.github/mac-app/README.md in the code repository): the debug build
+  # driven with Appium's Mac2 driver against an agent on this Mac, filmed from start to end.
+  mac-app-e2e:
+    needs: plan
+    if: needs.plan.outputs.macapp == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
+      PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      # The built app is kept by the app's code, like the iPhone app: a run that changes none of
+      # it (the check's own scripts, say) reuses it and skips the long build.
+      - name: Reuse a built Mac app
+        id: mac-app
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: mac-app
+          key: mac-app-e2e-debug-${{ hashFiles('app/src/**', 'app/static/**', 'app/src-tauri/**', 'app/package-lock.json', 'app/*.json', 'app/*.ts', 'app/*.js', 'crates/proto/**', 'crates/client/**', 'Cargo.lock', 'Cargo.toml', 'patches/**') }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # The app's Rust build, only when it is built here.
+      - if: steps.mac-app.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> target"
+          key: mac-app-debug
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      # A debug build as an .app, without the .dmg (the slow and flaky part of a release build).
+      - name: Build the Mac app (debug, unsigned)
+        if: steps.mac-app.outputs.cache-hit != 'true'
+        timeout-minutes: 45
+        working-directory: app
+        run: |
+          bash ../.github/quiet.sh npm ci
+          bash ../.github/quiet.sh npx tauri build --debug --bundles app
+          app=$(find ../target/debug/bundle/macos -maxdepth 1 -name '*.app' | head -n1)
+          [ -n "$app" ] || { echo "::error::no .app was built"; exit 1; }
+          mkdir -p ../mac-app && cp -R "$app" ../mac-app/PocketGPU.app
+      - if: steps.mac-app.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: mac-app
+          key: ${{ steps.mac-app.outputs.cache-primary-key }}
+      # The agent and stand-in phone: the same build, and so the same cache, as the iPhone
+      # check's (ios-smoke), on the same kind of Mac.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: e2e-target
+          key: ios-e2e-target-${{ hashFiles('Cargo.lock', 'crates/**') }}
+          restore-keys: ios-e2e-target-
+      # The Mac2 driver's test runner, built by Xcode at the first session: kept per Xcode and
+      # driver version (pinned in prepare.sh).
+      - id: xcode
+        run: echo "version=$(xcodebuild -version | head -n1 | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/Library/Developer/Xcode/DerivedData/WebDriverAgentMac-*
+          key: wda-mac-${{ steps.xcode.outputs.version }}-${{ hashFiles('.github/mac-app/prepare.sh') }}
+      # Keeps the display awake, installs ffmpeg, Appium and the Mac2 driver, puts the app in
+      # /Applications, grants the driver and the recorder their privacy permissions and logs
+      # what kind of session this job has.
+      - name: Prepare the Mac
+        timeout-minutes: 15
+        run: bash .github/mac-app/prepare.sh mac-app/PocketGPU.app
+      # Opens the app, pairs it by code with an agent on this Mac and waits for live stats,
+      # filmed (e2e-out/mac.mp4).
+      - name: Drive the app
+        id: drive
+        timeout-minutes: 30
+        continue-on-error: ${{ needs.plan.outputs.second_try == 'true' }}
+        run: bash .github/mac-app/e2e.sh mac.mp4
+      # With the admin page's second try on, a failed check starts over once, with the app's
+      # data cleared and a new agent (PGPU_DATA_DIR). The first try's film goes with the run;
+      # its screens stay in e2e-out-first on the runner.
+      - name: Second try
+        if: steps.drive.outcome == 'failure'
+        timeout-minutes: 30
+        env:
+          PGPU_DATA_DIR: ${{ runner.temp }}/pgpu-second-try
+        run: |
+          rm -rf e2e-out-first && mv e2e-out e2e-out-first || true
+          mkdir -p e2e-out
+          cp e2e-out-first/mac.mp4 e2e-out-first/mac-steps.txt e2e-out/ 2>/dev/null || true
+          bash .github/mac-app/prepare.sh reset
+          bash .github/mac-app/e2e.sh mac-try2.mp4
+      # A film still running (a step that timed out) is finished here, before it is sent.
+      - name: Stop the film
+        if: always()
+        timeout-minutes: 3
+        run: bash .github/mac-app/record.sh stop
+      - name: Send the screens and the film to the admin page
+        if: always()
+        timeout-minutes: 15
+        env:
+          PGPU_CHECKS_URL: ${{ vars.PGPU_PUSH_URL }}
+          PGPU_CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
+        run: sh .github/media-upload.sh macapp e2e-out
+      # The test runner's cache is saved after the job and the repository is public: it keeps the
+      # build only, not the session's test results and logs (what was on screen, keys typed).
+      - name: Keep the test runner's logs out of the cache
+        if: always()
+        run: rm -rf ~/Library/Developer/Xcode/DerivedData/WebDriverAgentMac-*/Logs
