@@ -33,10 +33,12 @@ name: Checks
 # The run's name says what it is and what started it: "Checks · <ref> · <tier> · <reason>", the
 # reason one of push, merge, nightly, release gate, by hand (no tier: "Checks · <ref> · by hand").
 #
-# Started by themselves: start-checks.yml here looks at the code repository's branches every few
-# minutes and starts `fast · push` for a branch that moved and `fast · merge` for main, whose
-# plan starts `devices · merge` beside it when the merge needs it; the schedule below is the
-# nightly run. By hand: the admin page's Checks, or Actions → Checks → Run workflow.
+# Started by themselves: watch.yml here looks at the code repository's branches every minute and
+# starts `fast · push` for a branch that moved and `fast · merge` for main, whose plan starts
+# `devices · merge` beside it when the merge needs it; once a day, at 02:23 UTC, it starts the
+# nightly run (`reason: nightly`, which is always Everything on main's newest commit). There is
+# no schedule here: GitHub runs schedules hours late in this repository.
+# By hand: the admin page's Checks, or Actions → Checks → Run workflow.
 # A push's run is cancelled by the run of the next push to the same branch; other runs finish.
 #
 # Already tested: a test that passes leaves a small cache entry here, named after the content of
@@ -57,7 +59,7 @@ name: Checks
 # .github/quiet.sh (PGPU_QUIET), which prints pass or fail and an error's headlines but never
 # the lines of code a compiler error quotes. Started and read from the admin page's Checks.
 run-name: >-
-  Checks · ${{ inputs.ref || 'main' }}${{ github.event_name == 'schedule' && ' · everything · nightly' || format('{0} · {1}', (inputs.tier && inputs.tier != 'none') && format(' · {0}', inputs.tier) || '', inputs.reason || 'by hand') }}
+  Checks · ${{ inputs.ref || 'main' }}${{ inputs.reason == 'nightly' && ' · everything · nightly' || format('{0} · {1}', (inputs.tier && inputs.tier != 'none') && format(' · {0}', inputs.tier) || '', inputs.reason || 'by hand') }}
 
 on:
   workflow_dispatch:
@@ -88,8 +90,6 @@ on:
         description: Test for real, also what already passed with the same files
         type: boolean
         default: false
-  schedule:
-    - cron: '23 2 * * *'
 
 permissions:
   contents: read
@@ -155,10 +155,9 @@ jobs:
       - name: What this change needs
         id: plan
         env:
-          EVENT: ${{ github.event_name }}
           TESTS: ${{ inputs.tests || 'auto' }}
-          TIER: ${{ github.event_name == 'schedule' && 'everything' || inputs.tier || 'none' }}
-          REASON: ${{ github.event_name == 'schedule' && 'nightly' || inputs.reason || 'by hand' }}
+          TIER: ${{ inputs.reason == 'nightly' && 'everything' || inputs.tier || 'none' }}
+          REASON: ${{ inputs.reason || 'by hand' }}
           BASE: ${{ inputs.base }}
           FRESH: ${{ inputs.fresh }}
           CHECKS_SETTINGS: ${{ vars.CHECKS_SETTINGS }}

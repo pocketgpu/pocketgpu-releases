@@ -1,0 +1,384 @@
+name: Watch
+
+# The one thing here that is always running. A run looks once a minute for about 55 minutes,
+# starts the next run and ends, so the looks don't depend on GitHub's schedule, which runs
+# hours late in this repository. What it looks at:
+#
+#   the branches  every minute. The branches of the private code repository pocketgpu/pocketgpu
+#                 that moved since the last look get their Checks (checks.yml):
+#                   a branch  →  Checks · <branch> · fast · push   the quick tests the change needs
+#                   main      →  Checks · main · fast · merge      the same for the merge; its plan
+#                                                                  starts Devices beside it when the
+#                                                                  merge touched the app's parts
+#                 A branch that moved twice between two looks is tested once, at its newest
+#                 commit. A new branch still at main's commit has nothing of its own to test. At
+#                 most ten runs start per look; the rest wait for the next one.
+#   the night     once a day, at the first look at or after 02:23 UTC: Checks · main ·
+#                 everything · nightly, while the admin page's nightly switch is on.
+#   the servers   every tenth look (and a run's first). The push server and the relays are
+#                 asked whether they answer, three tries each. One message goes out when
+#                 something stops and one when it is back:
+#                   by email      through Resend, with the secrets ALERT_EMAIL_KEY (a Resend key
+#                                 that may only send) and ALERT_EMAIL_TO; the sender is the
+#                                 variable ALERT_EMAIL_FROM, or "PocketGPU <hello@pocketgpu.app>"
+#                   on the phone  through the push server's owner alerts (POST /v1/owner/alert
+#                                 with the secret PUSH_CHECKS_TOKEN that Checks uses), while the
+#                                 push server itself answers
+#                 A server that is down doesn't fail the run while it looks: the log and the
+#                 run's summary say it and the messages carry it. A run ends red only when
+#                 something was down at its last look, so Actions and the admin page can tell.
+#
+# Tiers switched off on the admin page (the CHECKS_SETTINGS variable) start nothing. A run reads
+# the settings when it starts, so a switch is followed from the next run on, an hour later at
+# most; Checks itself reads them at once.
+#
+# One at a time. A run's first step lists the runs of this workflow that are queued or in
+# progress, and the run goes on only when none of them is older than itself (a lower run id),
+# not counting the run named in its `after` input: the run that started it, which is still
+# finishing. When there is an older one it looks again every 15 seconds for up to a minute,
+# because that one may be about to end, and then ends at once, green, having looked at nothing.
+# So of two that start together the lower id goes on and the higher gives way; the hourly
+# schedule below and a run by hand give way to the run that is going, and take over when none
+# is (a broken chain). A run that is run again goes on only when no other run is going at all.
+# There is no concurrency group: it would leave a trail of queued and cancelled runs.
+#
+# What it knows is one small cache entry here (watch-<run>): the branches and their commits, what
+# was down, and the day of the last nightly run. A run reads the newest entry when it starts and
+# saves a new one when it ends, if anything changed, before it starts the next run. A run that
+# dies before saving leaves the older entry to the next one: that may start a Checks run or send
+# a message twice, but never misses one. The first look ever, and one after the entry was lost,
+# only remembers the branches and starts nothing for them.
+#
+# It runs here and not in the code repository because a public repository's runners cost no
+# Actions minutes, and it must not live on the server it watches. The log is public: it prints
+# branch names, the first seven characters of commits, "push server" or "relay 1" and HTTP
+# codes, never an address, a token, an email or a message's text.
+#
+# To stop it: Actions → Watch → ··· → Disable workflow (cancelling a run only stops that run;
+# the schedule starts another within the hour). To start it: Actions → Watch → Run workflow.
+#
+# Needs the secret SOURCE_TOKEN (the one Checks uses: Contents: read on pocketgpu/pocketgpu) and
+# the variables PGPU_PUSH_URL and PGPU_DEFAULT_RELAYS (Checks uses both).
+# The source of this file is .github/releases-repo/watch.yml in the code repository, copied here
+# by releases-sync.yml there: edit it there, not here.
+on:
+  workflow_dispatch:
+    inputs:
+      after:
+        description: The run that started this one and is still finishing (empty by hand)
+        required: false
+        default: ''
+  # A safety net only: it gives way while a run is going. GitHub may run it hours late.
+  schedule:
+    - cron: '17 * * * *'
+
+# actions: starts Checks and the next run, lists this workflow's runs, replaces the cache entry.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    # The looks take 55 minutes; a look that waits for a server that is down may run over.
+    timeout-minutes: 70
+    steps:
+      - name: Only one at a time
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AFTER: ${{ inputs.after }}
+        run: |
+          set +e
+          workflow="${GITHUB_WORKFLOW_REF%@*}"
+          workflow="${workflow##*/}"
+          after="${AFTER//[^0-9]/}"
+          # A first try gives way to older runs only; a run that is run again, to any other.
+          which=".id < $GITHUB_RUN_ID"
+          [ "$GITHUB_RUN_ATTEMPT" = 1 ] || which=".id != $GITHUB_RUN_ID"
+          listed=''
+          others=''
+          for try in 1 2 3 4 5; do
+            if seen="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?per_page=50" \
+              --jq "[.workflow_runs[] | select(.status != \"completed\" and ($which) and (.id | tostring) != \"$after\") | .id] | join(\" \")" 2> /dev/null)"; then
+              listed=yes
+              others="$seen"
+              [ -n "$others" ] || break
+            fi
+            [ "$try" = 5 ] || sleep "${WATCH_GATE_WAIT:-15}"
+          done
+          if [ -z "$listed" ]; then
+            echo "Couldn't list this workflow's runs: this run looks anyway."
+          elif [ -n "$others" ]; then
+            echo "Another run is going ($others): nothing to do here."
+            exit 0
+          fi
+          if [ -n "$after" ]; then
+            echo "Started by run $after: this run looks now."
+          elif [ -n "$listed" ]; then
+            echo "No other run is going: this run looks."
+          fi
+          echo "go=true" >> "$GITHUB_OUTPUT"
+      - name: What it knew
+        if: steps.gate.outputs.go == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: watch
+          key: watch-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: watch-
+      - name: Look
+        id: look
+        if: steps.gate.outputs.go == 'true'
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          CHECKS_SETTINGS: ${{ vars.CHECKS_SETTINGS }}
+          PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
+          RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
+          CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
+          EMAIL_KEY: ${{ secrets.ALERT_EMAIL_KEY }}
+          EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          EMAIL_FROM: ${{ vars.ALERT_EMAIL_FROM || 'PocketGPU <hello@pocketgpu.app>' }}
+        run: |
+          # Nothing here may end the run early: each look says what went wrong and goes on.
+          set +e -o pipefail
+          # 55 minutes of looks, one a minute.
+          seconds="${WATCH_SECONDS:-3300}"
+          every="${WATCH_EVERY:-60}"
+          servers_every="${WATCH_SERVERS_EVERY:-10}"
+          pause="${WATCH_RETRY:-20}"
+          nightly_at="${WATCH_NIGHTLY_AT:-0223}"
+          code_repo="${WATCH_CODE_REPO:-https://github.com/pocketgpu/pocketgpu.git}"
+          dir=watch
+          mkdir -p "$dir"
+          touch "$dir/heads.txt" "$dir/down.txt" "$dir/nightly.txt"
+          sum() { cat "$dir/heads.txt" "$dir/down.txt" "$dir/nightly.txt" | sha256sum; }
+          before="$(sum)"
+          say() { echo "$(date -u +%H:%M) $*"; }
+          # note: a change in what answers, for the log and the run's summary.
+          note() {
+            say "servers: $*"
+            echo "- $(date -u +%H:%M) UTC: $*" >> "$GITHUB_STEP_SUMMARY"
+          }
+          # A switch is on unless the admin page's settings say it's off.
+          switch() {
+            jq -r "if $1 == false then \"off\" else \"on\" end" <<< "${CHECKS_SETTINGS:-null}" 2> /dev/null || echo on
+          }
+          fast="$(switch .tiers.fast.on)"
+          devices="$(switch .tiers.devices.on)"
+          nightly="$(switch .nightly)"
+          checks() {
+            gh workflow run checks.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" "$@" \
+              < /dev/null > /dev/null 2>&1
+          }
+
+          # The branches: one line each, "<commit> <branch>"; Checks for what moved.
+          branches() {
+            local old="$dir/heads.txt" now="$RUNNER_TEMP/heads.txt" next="$RUNNER_TEMP/next.txt"
+            local auth main_now main_was started sha branch was what inputs
+            auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SOURCE_TOKEN" | base64 -w0)"
+            if ! git -c http.extraheader="$auth" ls-remote --heads "$code_repo" 2> /dev/null |
+              sed -E 's#\trefs/heads/# #' | sort -k2 > "$now" || [ ! -s "$now" ]; then
+              say "branches: couldn't read them (SOURCE_TOKEN), nothing started"
+              return
+            fi
+            if [ ! -s "$old" ]; then
+              cp "$now" "$old"
+              say "branches: first look, $(wc -l < "$now") remembered, nothing started"
+              return
+            fi
+            if cmp -s "$now" "$old"; then
+              return
+            fi
+            main_now="$(awk '$2 == "main" { print $1 }' "$now")"
+            main_was="$(awk '$2 == "main" { print $1 }' "$old")"
+            started=0
+            : > "$next"
+            while read -r sha branch; do
+              was="$(awk -v b="$branch" '$2 == b { print $1 }' "$old")"
+              what=''
+              if [ "$sha" = "$was" ]; then
+                :
+              elif [[ ! "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ || "$branch" == *..* ]]; then
+                : # A name Checks wouldn't take.
+              elif [ "$branch" = main ]; then
+                [ "$fast$devices" = offoff ] || what=merge
+              elif [ "$fast" = on ] && [ "$sha" != "$main_now" ] && [ "$sha" != "$main_was" ]; then
+                what=push
+              fi
+              if [ -z "$what" ]; then
+                echo "$sha $branch" >> "$next"
+                continue
+              fi
+              inputs=(-f "ref=$branch" -f tier=fast -f "reason=$what")
+              if [ "$what" = merge ] && [ -n "$was" ]; then
+                inputs+=(-f "base=$was")
+              fi
+              if [ "$started" -lt 10 ] && checks "${inputs[@]}"; then
+                started=$((started + 1))
+                echo "$sha $branch" >> "$next"
+                say "branches: $branch is at ${sha:0:7} now, started Checks (fast, $what)"
+              else
+                # Not started (too many at once, or GitHub refused): as it was, for the next look.
+                [ -z "$was" ] || echo "$was $branch" >> "$next"
+                say "branches: $branch is at ${sha:0:7} now, not started this time"
+              fi
+            done < "$now"
+            cp "$next" "$old"
+          }
+
+          # The night: Everything on main, once a day, at the first look at or after its time.
+          night() {
+            local today
+            today="$(date -u +%F)"
+            if [ "$(cat "$dir/nightly.txt")" = "$today" ] || [ "$nightly" != on ] ||
+              [ "$((10#$(date -u +%H%M)))" -lt "$((10#$nightly_at))" ]; then
+              return
+            fi
+            if checks -f ref=main -f tier=everything -f reason=nightly; then
+              echo "$today" > "$dir/nightly.txt"
+              say "night: started Checks (everything, nightly) on main"
+            else
+              say "night: not started this time"
+            fi
+          }
+
+          # answers <url> <wanted>: three tries, 20 seconds apart. "200" wants exactly that;
+          # "any" takes every answer but a 5xx (the proxy says 502 when the relay is gone).
+          answers() {
+            local try code
+            for try in 1 2 3; do
+              code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2> /dev/null)" || code=000
+              if [ "$2" = 200 ] && [ "$code" = 200 ]; then return 0; fi
+              if [ "$2" = any ] && [ "$code" != 000 ] && [ "$code" -lt 500 ]; then return 0; fi
+              [ "$try" = 3 ] || sleep "$pause"
+            done
+            return 1
+          }
+          # tell <subject> <text>: the phone while the push server answers, and an email.
+          tell() {
+            local body code
+            if [ -n "$push_up" ] && [ -n "$CHECKS_TOKEN" ]; then
+              body="$(jq -n --arg t "$1" --arg u "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                '{kind: "server_problem", text: $t, url: $u}')"
+              code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X POST \
+                -H "Authorization: Bearer $CHECKS_TOKEN" -H 'Content-Type: application/json' \
+                -d "$body" "${PUSH_URL%/}/v1/owner/alert" 2> /dev/null)" || code=000
+              say "servers: phone alert $code"
+            fi
+            if [ -n "$EMAIL_KEY" ] && [ -n "$EMAIL_TO" ]; then
+              body="$(jq -n --arg from "$EMAIL_FROM" --arg to "$EMAIL_TO" --arg s "$1" --arg t "$2" \
+                '{from: $from, to: [$to], subject: $s, text: $t}')"
+              code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X POST \
+                -H "Authorization: Bearer $EMAIL_KEY" -H 'Content-Type: application/json' \
+                -d "$body" https://api.resend.com/emails 2> /dev/null)" || code=000
+              say "servers: email $code"
+            else
+              say "servers: email not set up (ALERT_EMAIL_KEY, ALERT_EMAIL_TO)"
+            fi
+          }
+          # The servers: what doesn't answer, and a message when that changed.
+          servers() {
+            local old="$dir/down.txt" now="$RUNNER_TEMP/down.txt" n=0 relay stopped back where
+            : > "$now"
+            push_up=
+            if [ -z "$PUSH_URL" ]; then
+              say "servers: PGPU_PUSH_URL isn't set, the push server isn't watched"
+            elif answers "${PUSH_URL%/}/healthz" 200; then
+              push_up=1
+            else
+              echo "push server" >> "$now"
+            fi
+            for relay in $(printf '%s' "$RELAYS" | tr ',' ' '); do
+              n=$((n + 1))
+              answers "${relay%/}/ping" any || echo "relay $n" >> "$now"
+            done
+            if [ -s "$now" ]; then
+              say "servers: no answer from $(paste -sd, "$now" | sed 's/,/, /g')"
+            else
+              say "servers: all answer"
+            fi
+            stopped="$(grep -vxF -f "$old" "$now" | paste -sd, - | sed 's/,/, /g')"
+            back="$(grep -vxF -f "$now" "$old" | paste -sd, - | sed 's/,/, /g')"
+            [ -s "$old" ] || stopped="$(paste -sd, "$now" | sed 's/,/, /g')"
+            [ -s "$now" ] || back="$(paste -sd, "$old" | sed 's/,/, /g')"
+            where="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/watch.yml"
+            if [ -n "$stopped" ]; then
+              note "$stopped stopped answering"
+              tell "PocketGPU: $stopped stopped answering" \
+                "Three tries in a minute got no answer from: $stopped. The looks are at $where"
+            fi
+            if [ -n "$back" ]; then
+              note "$back answers again"
+              tell "PocketGPU: $back answers again" "Back: $back. The looks are at $where"
+            fi
+            cp "$now" "$old"
+          }
+
+          began="$(date +%s)"
+          look=0
+          while [ $(($(date +%s) - began)) -lt "$seconds" ]; do
+            at="$(date +%s)"
+            look=$((look + 1))
+            branches
+            night
+            if [ $(((look - 1) % servers_every)) = 0 ]; then
+              servers
+            fi
+            took=$(($(date +%s) - at))
+            [ "$took" -ge "$every" ] || sleep $((every - took))
+          done
+          say "$look looks; the next run takes over"
+
+          [ "$(sum)" = "$before" ] || echo "changed=true" >> "$GITHUB_OUTPUT"
+          if [ -s "$dir/down.txt" ]; then
+            echo "down=$(paste -sd, "$dir/down.txt" | sed 's/,/, /g')" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Remember
+        if: steps.look.outputs.changed == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: watch
+          key: watch-${{ github.run_id }}-${{ github.run_attempt }}
+      # Only the newest entry is ever read. seen- and servers- are the entries of the two
+      # workflows this one replaced.
+      - name: Forget the older entries
+        if: steps.look.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: watch-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          for prefix in watch- seen- servers-; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=$prefix&per_page=100" \
+              --jq '.actions_caches[] | select(.key != env.KEEP) | .id' 2> /dev/null |
+              while read -r cache; do
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$cache" > /dev/null 2>&1 || true
+              done || true
+          done
+      # After the entry is saved, so the next run reads it; this run is still finishing then,
+      # which is why the next one is told its number. Not after a run was cancelled by hand.
+      - name: Start the next run
+        if: ${{ !cancelled() && steps.gate.outputs.go == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          workflow="${GITHUB_WORKFLOW_REF%@*}"
+          workflow="${workflow##*/}"
+          for try in 1 2 3; do
+            if gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+              -f "after=$GITHUB_RUN_ID" < /dev/null > /dev/null 2>&1; then
+              echo "Started the next run."
+              exit 0
+            fi
+            [ "$try" = 3 ] || sleep 10
+          done
+          echo "::warning::Couldn't start the next run: the hourly schedule starts one."
+      # Last, so everything above is done: red tells Actions and the admin page.
+      - name: Something is down
+        if: ${{ !cancelled() && steps.look.outputs.down != '' }}
+        env:
+          DOWN: ${{ steps.look.outputs.down }}
+        run: |
+          echo "::error::Doesn't answer at the last look: $DOWN"
+          echo "Doesn't answer at the last look: $DOWN" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
