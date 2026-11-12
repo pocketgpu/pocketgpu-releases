@@ -24,6 +24,10 @@ on:
       tag:
         description: Tag in pocketgpu/pocketgpu, like v1.2.0
         required: true
+      notes:
+        description: What changed; goes at the top of the GitHub release (the admin page drafts it)
+        required: false
+        default: ''
   repository_dispatch:
     types: [release]
 
@@ -350,8 +354,11 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: ${{ inputs.notes }}
         run: |
-          cat > notes.md <<'NOTES'
+          : > notes.md
+          if [ -n "$RELEASE_NOTES" ]; then printf '%s\n\n' "$RELEASE_NOTES" > notes.md; fi
+          cat >> notes.md <<'NOTES'
           Install: `curl -fsSL https://pocketgpu.app/install | sh` (Linux, Apple silicon Macs) or
           `irm https://pocketgpu.app/install.ps1 | iex` (Windows). Update: `pgpu update`.
           Windows: one app, `PocketGPU-x86_64-setup.exe` (beta, unsigned; SmartScreen: More info →
