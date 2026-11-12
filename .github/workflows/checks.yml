@@ -51,6 +51,10 @@ name: Checks
 # Checks (fast)": running, passed, failed) when SOURCE_TOKEN may; without that they say so and
 # go on (admin/docs/owner-todo.md in the code repository, Checks).
 #
+# To the owner: a failed run on main also reaches the owner's phone and email through the push
+# server (`report`, .github/owner-alert.sh, with PUSH_CHECKS_TOKEN and PGPU_PUSH_URL; the admin
+# page's Alerts to you says which): "Checks failed on main", or "The nightly run failed".
+#
 # Needs the secret SOURCE_TOKEN (fine-grained token, Contents: read on pocketgpu/pocketgpu;
 # with Commit statuses: read and write it also reports to the commit).
 # Run logs are public: nothing here uploads GitHub artifacts or prints secrets; the e2e check keeps
@@ -699,8 +703,9 @@ jobs:
 
   # After the tests. Remembers each test that passed, under the key the plan made from the files
   # it covers, so a later run of the same files can reuse the result; forgets an earlier pass
-  # when the same files fail now; and says on the commit and its pull request how the run went.
-  # It checks out nothing and never fails the run.
+  # when the same files fail now; says on the commit and its pull request how the run went; and
+  # tells the owner when a run on main failed. It checks out no code (only the alert script,
+  # for that last step) and never fails the run.
   report:
     needs: [plan, rust, web, agent-windows, agent-macos, android-e2e, ios-smoke, mac-app-e2e]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.testing == 'true'
@@ -822,3 +827,41 @@ jobs:
           else
             echo "Not on the commit (HTTP $code): SOURCE_TOKEN may not set commit statuses yet."
           fi
+      # A failed run on main reaches the owner's phone and email (the admin page's Alerts to
+      # you says which, and holds them in quiet hours): .github/owner-alert.sh of the code
+      # repository's main, the only file fetched, into a folder of its own. The text is the
+      # line this job already printed above (test names); the script prints an HTTP code only.
+      - name: The alert script
+        id: script
+        if: always() && steps.went.outputs.state == 'failure' && env.REF == 'main'
+        continue-on-error: true
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: main
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          path: alert-script
+          sparse-checkout: .github/owner-alert.sh
+          sparse-checkout-cone-mode: false
+      - name: Tell the owner
+        if: always() && steps.script.outcome == 'success'
+        env:
+          PGPU_CHECKS_URL: ${{ vars.PGPU_PUSH_URL }}
+          PGPU_CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
+          TEXT: ${{ steps.went.outputs.text }}
+          TIER: ${{ needs.plan.outputs.tier }}
+          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.reason == 'nightly' }}
+        run: |
+          if [ ! -f alert-script/.github/owner-alert.sh ]; then
+            echo "main has no alert script yet: nothing sent."
+            exit 0
+          fi
+          kind=check_failed_main
+          what="Checks on main"
+          [ "$TIER" = none ] || what="$what ($TIER)"
+          if [ "$NIGHTLY" = true ]; then
+            kind=nightly_failed
+            what="The nightly run"
+          fi
+          sh alert-script/.github/owner-alert.sh "$kind" "$what $TEXT. Tap to open the run."

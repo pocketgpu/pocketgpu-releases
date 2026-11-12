@@ -13,6 +13,8 @@ name: Release
 #             MINISIGN_PASSWORD
 #   variables PGPU_DEFAULT_RELAYS, PGPU_PUSH_URL (our servers, built into the binaries;
 #             empty: n0's public relays and the default push address)
+# When it ends, the owner hears how it went on their phone and by email (job `tell`,
+# .github/owner-alert.sh, with the secret PUSH_CHECKS_TOKEN that Checks uses; optional).
 # Run logs are public: nothing here may print a secret or the source.
 run-name: Release ${{ inputs.tag || github.event.client_payload.tag }}
 
@@ -431,3 +433,46 @@ jobs:
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign the image
         run: cosign sign --yes ghcr.io/pocketgpu/pocketgpu@${{ steps.push.outputs.digest }}
+
+  # Tells the owner how the release went, on their phone and by email (the admin page's Alerts
+  # to you says which): published, or what stopped it. The alert script is the one file fetched
+  # from the code repository's main; it prints an HTTP code only. Nothing here can fail the run,
+  # and a cancelled run tells nothing.
+  tell:
+    name: Tell the owner
+    needs: [version, build, windows, macos, client, release, docker]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: main
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          path: alert-script
+          sparse-checkout: .github/owner-alert.sh
+          sparse-checkout-cone-mode: false
+      - name: Tell the owner
+        env:
+          PGPU_CHECKS_URL: ${{ vars.PGPU_PUSH_URL }}
+          PGPU_CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          if [ ! -f alert-script/.github/owner-alert.sh ]; then
+            echo "main has no alert script yet: nothing sent."
+            exit 0
+          fi
+          failed=$(jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")' <<<"$NEEDS")
+          if [ "$(jq -r '.release.result' <<<"$NEEDS")" = success ]; then
+            kind=release_finished
+            text="Agent and desktop app $TAG are published."
+            [ -z "$failed" ] || text="$text Failed beside it: $failed."
+          else
+            kind=release_failed
+            text="Agent and desktop app $TAG were not published."
+            [ -z "$failed" ] || text="$text Failed: $failed."
+          fi
+          sh alert-script/.github/owner-alert.sh "$kind" "$text Tap to open the run."
