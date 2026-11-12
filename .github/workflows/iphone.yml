@@ -224,6 +224,33 @@ jobs:
           archive=$(find src-tauri/gen/apple/build -maxdepth 2 -name '*.xcarchive' | head -n1)
           [ -n "$archive" ] || { echo "::error::no .xcarchive was built"; exit 1; }
           echo "ARCHIVE=$PWD/$archive" >> "$GITHUB_ENV"
+      # Which layer has the App Group: each profile this run made, then the signed archive.
+      # Prints only entitlement names and their group ids (no team or person names).
+      - name: App Group in the profiles and the archive
+        if: always() && env.ARCHIVE != ''
+        run: |
+          set -uo pipefail
+          t="$RUNNER_TEMP/diag" && mkdir -p "$t"
+          for f in "$HOME/Library/MobileDevice/Provisioning Profiles"/*.mobileprovision; do
+            [ -f "$f" ] || continue
+            security cms -D -i "$f" > "$t/p.plist" 2>/dev/null || continue
+            id=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$t/p.plist" 2>/dev/null | sed 's/^[^.]*\.//')
+            groups=$(plutil -extract 'Entitlements.com\.apple\.security\.application-groups' json -o - "$t/p.plist" 2>/dev/null || echo none)
+            aps=$(plutil -extract Entitlements.aps-environment raw -o - "$t/p.plist" 2>/dev/null || echo none)
+            echo "profile for $id: application-groups=$groups aps-environment=$aps"
+          done
+          for b in "$ARCHIVE"/Products/Applications/*.app "$ARCHIVE"/Products/Applications/*.app/PlugIns/*.appex; do
+            [ -d "$b" ] || continue
+            codesign -d --entitlements - --xml "$b" 2>/dev/null > "$t/e.plist" || { echo "$(basename "$b"): not signed"; continue; }
+            groups=$(plutil -extract 'com\.apple\.security\.application-groups' json -o - "$t/e.plist" 2>/dev/null || echo none)
+            echo "archive $(basename "$b"): application-groups=$groups"
+          done
+          for e in app/src-tauri/gen/apple/*/*.entitlements; do
+            [ -f "$e" ] || continue
+            groups=$(plutil -extract 'com\.apple\.security\.application-groups' json -o - "$e" 2>/dev/null || echo none)
+            echo "file $(basename "$e"): application-groups=$groups"
+          done
+          rm -rf "$t"
       - name: Export the .ipa
         env:
           PROFILE_APP: ${{ steps.sign.outputs.profile_app }}
@@ -278,7 +305,7 @@ jobs:
             echo "$(basename "$b"): $short ($num)"
             [ "$short" = "$VERSION" ] && [ "$num" = "$BUILD" ] || bad=1
             codesign -d --entitlements - --xml "$b" 2>/dev/null > "$x/ent.plist"
-            plutil -extract com.apple.security.application-groups xml1 -o - "$x/ent.plist" | grep -q 'group.app.pocketgpu' ||
+            plutil -extract 'com\.apple\.security\.application-groups' xml1 -o - "$x/ent.plist" | grep -q 'group.app.pocketgpu' ||
               { echo "::error::$(basename "$b") lacks the App Group"; bad=1; }
           done
           codesign -d --entitlements - --xml "$app" 2>/dev/null > "$x/ent.plist"
