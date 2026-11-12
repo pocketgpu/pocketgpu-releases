@@ -1,0 +1,402 @@
+name: iPhone
+
+# Builds the iPhone app (with its widget extension) from the private code repository
+# pocketgpu/pocketgpu, signs it for the App Store and uploads it to TestFlight. It runs here
+# because a public repository's runners, macOS included, cost no Actions minutes. The source
+# of this file is .github/releases-repo/iphone.yml in the code repository, copied here by
+# releases-sync.yml there: edit it there, not here.
+#
+# Start it from the admin page's Releases (which fills in every input), or Actions → iPhone →
+# Run workflow. The version may not be lower than one already on TestFlight; the build number
+# is chosen here: one above every build App Store Connect has of the app, and never below this
+# workflow's run number.
+#
+# Signing needs no certificate or profile from anyone: .github/ios/asc.mjs (from the code
+# repository's main) makes one Apple Distribution certificate through the App Store Connect
+# API on the first run and keeps it, encrypted with a key derived from APPSTORE_API_KEY, as a
+# draft release `ios-signing` here (which is why this job may write contents); each run makes
+# fresh App Store profiles for the app and its widgets and signs both by hand (Xcode's
+# automatic signing would make a new development certificate on every fresh runner).
+# Nothing is kept as a run artifact: the .ipa goes to App Store Connect and nowhere else.
+# Needs, in this repository's settings:
+#   secrets   SOURCE_TOKEN             fine-grained token, Contents: read on pocketgpu/pocketgpu
+#             APPSTORE_API_KEY_ID      App Store Connect → Users and Access → Integrations →
+#             APPSTORE_API_ISSUER_ID   Team Keys: a key with the App Manager role (or Admin)
+#             APPSTORE_API_KEY         the key's .p8 text
+#             APPLE_TEAM_ID
+#   variables PGPU_DEFAULT_RELAYS, PGPU_PUSH_URL
+# When it ends, the owner hears how it went on their phone and by email (job `tell`,
+# .github/owner-alert.sh, with the secret PUSH_CHECKS_TOKEN that Checks uses; optional).
+# Run logs are public: nothing here may print a secret, the source, or the certificate's name
+# (it holds the developer's legal name); builds run through .github/quiet.sh.
+# The admin page reads the version and the commit back from this title.
+run-name: iPhone ${{ inputs.version }} → TestFlight · ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit in pocketgpu/pocketgpu
+        required: true
+        default: main
+      version:
+        description: App version, like 1.2.9 (not lower than the newest on TestFlight)
+        required: true
+      notes:
+        description: What to Test on TestFlight (optional)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iphone
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PGPU_QUIET: '1'
+  PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
+  PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
+  BUNDLE_ID: app.pocketgpu
+  WIDGET_BUNDLE_ID: app.pocketgpu.widgets
+  CI: 'true'
+
+jobs:
+  build:
+    name: Build and upload
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      # The draft release `ios-signing` that keeps the signing certificate (asc.mjs).
+      contents: write
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      build: ${{ steps.plan.outputs.build }}
+    env:
+      ASC_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+      ASC_KEY: ${{ secrets.APPSTORE_API_KEY }}
+      APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      # The App Store Connect script from main, so an older commit can be built too.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: main
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          path: release-tools
+          sparse-checkout: .github/ios/asc.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Settings
+        run: |
+          missing=""
+          for s in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY APPLE_DEVELOPMENT_TEAM; do
+            [ -n "${!s}" ] || missing="$missing $s"
+          done
+          [ -z "$missing" ] || { echo "::error::Missing secrets:$missing (see the top of iphone.yml)"; exit 1; }
+          xcodebuild -version | head -n1
+          major=$(xcodebuild -version | head -n1 | sed -E 's/Xcode ([0-9]+).*/\1/')
+          [ "$major" -ge 26 ] || { echo "::error::App Store Connect takes builds from Xcode 26 or later"; exit 1; }
+      # Before the long build: the version against TestFlight, and the build number.
+      - name: Version and build number
+        id: plan
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          node release-tools/.github/ios/asc.mjs plan "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Set the version
+        env:
+          VERSION: ${{ inputs.version }}
+          BUILD: ${{ steps.plan.outputs.build }}
+        run: |
+          node -e "
+            const f = './app/src-tauri/tauri.conf.json', fs = require('fs');
+            const c = JSON.parse(fs.readFileSync(f));
+            c.version = process.env.VERSION;
+            c.bundle.iOS = { ...c.bundle.iOS, bundleVersion: process.env.BUILD };
+            fs.writeFileSync(f, JSON.stringify(c, null, 2) + '\n');
+          "
+          echo "Building iPhone $VERSION ($BUILD)"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> target"
+          key: ios-release
+          cache-on-failure: true
+      - run: brew install xcodegen
+      - name: Install UI and Tauri CLI
+        run: bash ../.github/quiet.sh npm ci
+        working-directory: app
+      - name: Generate the Xcode project
+        working-directory: app
+        run: |
+          bash ../.github/quiet.sh npx tauri ios init --ci --skip-targets-install
+          ruby src-tauri/ios/add-widgets.rb
+      - name: Signing certificate and profiles
+        id: sign
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node release-tools/.github/ios/asc.mjs signing "$RUNNER_TEMP/signing"
+      - name: Keychain
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/signing"
+          pw=$(openssl rand -hex 24)
+          echo "::add-mask::$pw"
+          # macOS's own openssl (LibreSSL) writes a .p12 the keychain reads; OpenSSL 3 needs -legacy.
+          ossl=/usr/bin/openssl
+          legacy=""
+          "$ossl" version | grep -q '^OpenSSL 3' && legacy="-legacy"
+          "$ossl" x509 -inform DER -in "$dir/cert.cer" -out "$dir/cert.pem"
+          P12_PW="$pw" "$ossl" pkcs12 -export $legacy -inkey "$dir/key.pem" -in "$dir/cert.pem" \
+            -out "$dir/identity.p12" -passout env:P12_PW
+          kc="$RUNNER_TEMP/release.keychain-db"
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          security import "$dir/identity.p12" -k "$kc" -P "$pw" -T /usr/bin/codesign -T /usr/bin/security > /dev/null
+          # Apple's intermediate for distribution certificates, in case the image lacks it.
+          curl -fsSL -o "$dir/wwdr.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer &&
+            security import "$dir/wwdr.cer" -k "$kc" > /dev/null || true
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" > /dev/null
+          others=()
+          while IFS= read -r k; do others+=("$k"); done < <(security list-keychains -d user | tr -d '"' | sed 's/^ *//')
+          security list-keychains -d user -s "$kc" "${others[@]}"
+          # The identity's name holds the developer's legal name: count it, don't print it.
+          n=$(security find-identity -v -p codesigning "$kc" | grep -c 'Apple Distribution' || true)
+          [ "$n" -ge 1 ] || { echo "::error::the distribution identity isn't in the keychain"; exit 1; }
+          rm -f "$dir/identity.p12" "$dir/key.pem"
+          echo "KEYCHAIN=$kc" >> "$GITHUB_ENV"
+      # Both targets signed by hand with the distribution identity and this run's profiles, and
+      # the app's push entitlement set for production (the profile's own value).
+      - name: Sign for the App Store
+        working-directory: app/src-tauri/gen/apple
+        env:
+          PROFILE_APP: ${{ steps.sign.outputs.profile_app }}
+          PROFILE_WIDGETS: ${{ steps.sign.outputs.profile_widgets }}
+        run: |
+          set -euo pipefail
+          ruby - <<'RUBY'
+          require 'yaml'
+          spec = YAML.load_file('project.yml')
+          targets = spec.fetch('targets')
+          app_name, app = targets.find { |_, t| t['type'] == 'application' }
+          widgets = targets['PocketGPUWidgets'] or abort 'project.yml has no PocketGPUWidgets target'
+          abort 'project.yml has no application target' unless app
+          sign = lambda do |t, profile|
+            t['settings'] ||= {}
+            base = (t['settings']['base'] ||= {})
+            base.merge!(
+              'CODE_SIGN_STYLE' => 'Manual',
+              'DEVELOPMENT_TEAM' => ENV.fetch('APPLE_DEVELOPMENT_TEAM'),
+              'CODE_SIGN_IDENTITY' => 'Apple Distribution',
+              'CODE_SIGN_IDENTITY[sdk=iphoneos*]' => 'Apple Distribution',
+              'PROVISIONING_PROFILE_SPECIFIER' => profile
+            )
+          end
+          sign.call(app, ENV.fetch('PROFILE_APP'))
+          sign.call(widgets, ENV.fetch('PROFILE_WIDGETS'))
+          ent = (app['entitlements'] ||= { 'path' => "#{app_name}/#{app_name}.entitlements" })
+          (ent['properties'] ||= {})['aps-environment'] = 'production'
+          File.write('project.yml', spec.to_yaml)
+          RUBY
+          xcodegen generate --spec project.yml --project . > /dev/null
+          /usr/libexec/PlistBuddy -c "Print :aps-environment" ./*/*_iOS.entitlements
+      - name: Build the archive
+        working-directory: app
+        run: |
+          bash ../.github/quiet.sh npx tauri ios build --ci --target aarch64 --archive-only
+          archive=$(find src-tauri/gen/apple/build -maxdepth 2 -name '*.xcarchive' | head -n1)
+          [ -n "$archive" ] || { echo "::error::no .xcarchive was built"; exit 1; }
+          echo "ARCHIVE=$PWD/$archive" >> "$GITHUB_ENV"
+      - name: Export the .ipa
+        env:
+          PROFILE_APP: ${{ steps.sign.outputs.profile_app }}
+          PROFILE_WIDGETS: ${{ steps.sign.outputs.profile_widgets }}
+        run: |
+          set -euo pipefail
+          opts="$RUNNER_TEMP/ExportOptions.plist"
+          cat > "$opts" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>$APPLE_DEVELOPMENT_TEAM</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$BUNDLE_ID</key><string>$PROFILE_APP</string>
+              <key>$WIDGET_BUNDLE_ID</key><string>$PROFILE_WIDGETS</string>
+            </dict>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          EOF
+          out="$RUNNER_TEMP/export"
+          bash .github/quiet.sh xcodebuild -exportArchive -archivePath "$ARCHIVE" \
+            -exportPath "$out" -exportOptionsPlist "$opts"
+          ipa=$(find "$out" -name '*.ipa' | head -n1)
+          [ -n "$ipa" ] || { echo "::error::no .ipa was exported"; exit 1; }
+          echo "IPA=$ipa" >> "$GITHUB_ENV"
+          echo "$(wc -c < "$ipa" | tr -d ' ') bytes"
+      # What App Store Connect would refuse later, found now: the versions of the app and its
+      # widgets, the widgets inside, production push, and the App Group on both.
+      - name: Check the .ipa
+        env:
+          VERSION: ${{ inputs.version }}
+          BUILD: ${{ steps.plan.outputs.build }}
+        run: |
+          set -euo pipefail
+          x="$RUNNER_TEMP/ipa-check"
+          rm -rf "$x" && mkdir -p "$x" && unzip -q "$IPA" -d "$x"
+          app=$(find "$x/Payload" -maxdepth 1 -name '*.app' | head -n1)
+          ext="$app/PlugIns/PocketGPUWidgets.appex"
+          [ -d "$ext" ] || { echo "::error::the widget extension isn't in the app"; exit 1; }
+          bad=0
+          for b in "$app" "$ext"; do
+            short=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$b/Info.plist")
+            num=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$b/Info.plist")
+            echo "$(basename "$b"): $short ($num)"
+            [ "$short" = "$VERSION" ] && [ "$num" = "$BUILD" ] || bad=1
+            codesign -d --entitlements - --xml "$b" 2>/dev/null > "$x/ent.plist"
+            plutil -extract com.apple.security.application-groups xml1 -o - "$x/ent.plist" | grep -q 'group.app.pocketgpu' ||
+              { echo "::error::$(basename "$b") lacks the App Group"; bad=1; }
+          done
+          codesign -d --entitlements - --xml "$app" 2>/dev/null > "$x/ent.plist"
+          aps=$(plutil -extract aps-environment raw -o - "$x/ent.plist" 2>/dev/null || echo none)
+          echo "aps-environment: $aps"
+          [ "$aps" = production ] || bad=1
+          rm -rf "$x"
+          [ "$bad" = 0 ] || { echo "::error::the .ipa isn't what App Store Connect expects (above)"; exit 1; }
+      - name: Upload to TestFlight
+        id: upload
+        env:
+          VERSION: ${{ inputs.version }}
+          BUILD: ${{ steps.plan.outputs.build }}
+          APP_ID: ${{ steps.plan.outputs.app_id }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -uo pipefail
+          keys="$RUNNER_TEMP/asc-keys"
+          mkdir -p "$keys" && chmod 700 "$keys"
+          ( umask 077; printf '%s\n' "$ASC_KEY" > "$keys/AuthKey_$ASC_KEY_ID.p8" )
+          log="$RUNNER_TEMP/upload.log"
+          API_PRIVATE_KEYS_DIR="$keys" xcrun altool --upload-package "$IPA" --platform ios \
+            --apple-id "$APP_ID" --bundle-id "$BUNDLE_ID" \
+            --bundle-version "$BUILD" --bundle-short-version-string "$VERSION" \
+            --api-key "$ASC_KEY_ID" --api-issuer "$ASC_ISSUER_ID" > "$log" 2>&1
+          status=$?
+          rm -rf "$keys"
+          # altool has exited 0 on a failed upload: its words count too.
+          if [ "$status" -ne 0 ] || grep -qiE 'UPLOAD FAILED|ERROR ITMS-|product-errors' "$log"; then
+            grep -iE 'error|fail' "$log" | head -20
+            echo "::error::the upload to App Store Connect failed (exit $status)"
+            exit 1
+          fi
+          tail -n 3 "$log"
+          {
+            echo "### iPhone $VERSION ($BUILD) → TestFlight"
+            echo
+            echo "Uploaded from \`$REF\`. It is **processing on TestFlight** now; the next job says when testers can install it."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Clean up
+        if: always()
+        run: |
+          [ -z "${KEYCHAIN:-}" ] || security delete-keychain "$KEYCHAIN" || true
+          rm -rf "$RUNNER_TEMP/signing" "$RUNNER_TEMP/asc-keys" "$RUNNER_TEMP/ipa-check"
+          rm -f "$HOME"/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision \
+            "$HOME"/Library/Developer/Xcode/UserData/Provisioning\ Profiles/*.mobileprovision
+
+  # Waits for Apple's processing (usually 5–30 minutes), then sets What to Test from the notes.
+  testflight:
+    name: TestFlight
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: main
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          path: release-tools
+          sparse-checkout: .github/ios/asc.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Wait for processing
+        env:
+          ASC_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          ASC_KEY: ${{ secrets.APPSTORE_API_KEY }}
+          NOTES: ${{ inputs.notes }}
+          VERSION: ${{ needs.build.outputs.version }}
+          BUILD: ${{ needs.build.outputs.build }}
+          WAIT_MINUTES: '50'
+        run: node release-tools/.github/ios/asc.mjs testflight "$VERSION" "$BUILD"
+
+  # Tells the owner how it went, on their phone and by email (the admin page's Alerts to you
+  # says which). The alert script is the one file fetched from the code repository's main; it
+  # prints an HTTP code only. Nothing here can fail the run, and a cancelled run tells nothing.
+  tell:
+    name: Tell the owner
+    needs: [build, testflight]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: main
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          path: alert-script
+          sparse-checkout: .github/owner-alert.sh
+          sparse-checkout-cone-mode: false
+      - name: Tell the owner
+        env:
+          PGPU_CHECKS_URL: ${{ vars.PGPU_PUSH_URL }}
+          PGPU_CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
+          BUILT: ${{ needs.build.result }}
+          PROCESSED: ${{ needs.testflight.result }}
+          VERSION: ${{ needs.build.outputs.version || inputs.version }}
+          BUILD: ${{ needs.build.outputs.build }}
+        run: |
+          if [ ! -f alert-script/.github/owner-alert.sh ]; then
+            echo "main has no alert script yet: nothing sent."
+            exit 0
+          fi
+          if [ "$BUILT" = success ] && [ "$PROCESSED" = success ]; then
+            kind=release_finished
+            text="iPhone $VERSION ($BUILD) is ready on TestFlight."
+          elif [ "$BUILT" = success ]; then
+            kind=release_failed
+            text="iPhone $VERSION ($BUILD) is uploaded, but TestFlight hasn't finished processing it."
+          else
+            kind=release_failed
+            text="iPhone ${VERSION:-app} was not uploaded to TestFlight."
+          fi
+          sh alert-script/.github/owner-alert.sh "$kind" "$text Tap to open the run."
