@@ -1,0 +1,165 @@
+name: Watch servers
+
+# Asks the push server and the relays every ten minutes whether they answer, and tells the
+# owner when one stops or comes back:
+#   by email      through Resend, with the secrets ALERT_EMAIL_KEY (a Resend key that may only
+#                 send) and ALERT_EMAIL_TO; the sender is the variable ALERT_EMAIL_FROM, or
+#                 "PocketGPU <hello@pocketgpu.app>"
+#   on the phone  through the push server's owner alerts (POST /v1/owner/alert with the secret
+#                 PUSH_CHECKS_TOKEN that Checks uses), while the push server itself answers
+# Without those it still looks, and a run is red for as long as something is down, so Actions
+# and the admin page's Home show it. One message goes out when something stops and one when
+# it is back, not one every ten minutes.
+#
+# It runs here, in the public repository, because its runners cost no Actions minutes and it
+# must not live on the server it watches. What was down at the last look is one small cache
+# entry (servers-<run>). The log is public: it prints "push server" or "relay 1", never an
+# address, a token or an email.
+#
+# Needs the variables PGPU_PUSH_URL and PGPU_DEFAULT_RELAYS (Checks uses both). GitHub runs
+# schedules late at busy times, so a look can be a few minutes off.
+# The source of this file is .github/releases-repo/watch-servers.yml in the code repository,
+# copied here by releases-sync.yml there: edit it there, not here.
+on:
+  schedule:
+    - cron: '4-59/10 * * * *'
+  workflow_dispatch:
+
+# actions: replaces the cache entry.
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: watch-servers
+  cancel-in-progress: false
+
+jobs:
+  look:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: What was down last time
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: servers
+          key: servers-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: servers-
+      - name: Ask the servers
+        id: look
+        env:
+          PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
+          RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
+          CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
+          EMAIL_KEY: ${{ secrets.ALERT_EMAIL_KEY }}
+          EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          EMAIL_FROM: ${{ vars.ALERT_EMAIL_FROM || 'PocketGPU <hello@pocketgpu.app>' }}
+        run: |
+          mkdir -p servers
+          old=servers/down.txt
+          now="$RUNNER_TEMP/down.txt"
+          : > "$now"
+          touch "$old"
+
+          # answers <url> <wanted>: three tries, 20 seconds apart. "200" wants exactly that;
+          # "any" takes every answer but a 5xx (the proxy says 502 when the relay is gone).
+          answers() {
+            for try in 1 2 3; do
+              code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null)" || code=000
+              if [ "$2" = 200 ] && [ "$code" = 200 ]; then return 0; fi
+              if [ "$2" = any ] && [ "$code" != 000 ] && [ "$code" -lt 500 ]; then return 0; fi
+              [ "$try" = 3 ] || sleep 20
+            done
+            return 1
+          }
+
+          push_up=
+          if [ -z "$PUSH_URL" ]; then
+            echo "PGPU_PUSH_URL isn't set: the push server isn't watched."
+          elif answers "${PUSH_URL%/}/healthz" 200; then
+            push_up=1
+            echo "push server: answers"
+          else
+            echo "push server" >> "$now"
+            echo "push server: doesn't answer"
+          fi
+          n=0
+          for relay in $(printf '%s' "$RELAYS" | tr ',' ' '); do
+            n=$((n + 1))
+            if answers "${relay%/}/ping" any; then
+              echo "relay $n: answers"
+            else
+              echo "relay $n" >> "$now"
+              echo "relay $n: doesn't answer"
+            fi
+          done
+
+          stopped="$(grep -vxF -f "$old" "$now" | paste -sd, - | sed 's/,/, /g' || true)"
+          back="$(grep -vxF -f "$now" "$old" | paste -sd, - | sed 's/,/, /g' || true)"
+          [ -s "$old" ] || stopped="$(paste -sd, "$now" | sed 's/,/, /g')"
+          [ -s "$now" ] || back="$(paste -sd, "$old" | sed 's/,/, /g')"
+
+          # tell <subject> <text>: the phone while the push server answers, and an email.
+          tell() {
+            if [ -n "$push_up" ] && [ -n "$CHECKS_TOKEN" ]; then
+              body="$(jq -n --arg t "$1" --arg u "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                '{kind: "server_problem", text: $t, url: $u}')"
+              code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X POST \
+                -H "Authorization: Bearer $CHECKS_TOKEN" -H 'Content-Type: application/json' \
+                -d "$body" "${PUSH_URL%/}/v1/owner/alert" 2>/dev/null)" || code=000
+              echo "phone alert: $code"
+            fi
+            if [ -n "$EMAIL_KEY" ] && [ -n "$EMAIL_TO" ]; then
+              body="$(jq -n --arg from "$EMAIL_FROM" --arg to "$EMAIL_TO" --arg s "$1" --arg t "$2" \
+                '{from: $from, to: [$to], subject: $s, text: $t}')"
+              code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X POST \
+                -H "Authorization: Bearer $EMAIL_KEY" -H 'Content-Type: application/json' \
+                -d "$body" https://api.resend.com/emails 2>/dev/null)" || code=000
+              echo "email: $code"
+            else
+              echo "email: not set up (ALERT_EMAIL_KEY, ALERT_EMAIL_TO)"
+            fi
+          }
+
+          where="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/watch-servers.yml"
+          if [ -n "$stopped" ]; then
+            tell "PocketGPU: $stopped stopped answering" \
+              "Three tries in a minute got no answer from: $stopped. The looks are at $where"
+          fi
+          if [ -n "$back" ]; then
+            tell "PocketGPU: $back answers again" "Back: $back. The looks are at $where"
+          fi
+
+          if ! cmp -s "$now" "$old"; then
+            cp "$now" "$old"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -s "$now" ]; then
+            echo "down=$(paste -sd, "$now" | sed 's/,/, /g')" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Remember
+        if: steps.look.outputs.changed == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: servers
+          key: servers-${{ github.run_id }}-${{ github.run_attempt }}
+      # Only the newest entry is ever read.
+      - name: Forget the older entries
+        if: steps.look.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: servers-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=servers-&per_page=100" \
+            --jq '.actions_caches[] | select(.key != env.KEEP) | .id' 2>/dev/null |
+            while read -r cache; do
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$cache" > /dev/null 2>&1 || true
+            done || true
+      - name: Something is down
+        if: steps.look.outputs.down != ''
+        env:
+          DOWN: ${{ steps.look.outputs.down }}
+        run: |
+          echo "::error::Doesn't answer: $DOWN"
+          echo "Doesn't answer: $DOWN" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
