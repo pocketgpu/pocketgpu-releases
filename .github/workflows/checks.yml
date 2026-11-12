@@ -19,23 +19,45 @@ name: Checks
 #                  (app/e2e/android.mjs and .github/android/ in the code repository)
 #   mac-app-e2e    the Mac app (a debug build) on a Mac against an agent on the same Mac, driven
 #                  with Appium's Mac2 driver: the first screen, pairing by code and live stats,
-#                  filmed from start to end (.github/mac-app/, app/e2e/mac.mjs). Nightly and when
-#                  picked (tests: macapp); not for every change unless the admin page ticks it.
+#                  filmed from start to end (.github/mac-app/, app/e2e/mac.mjs). In Devices and
+#                  Everything, not in Fast.
 #
-# A run first works out which of these the change needs (`plan`, .github/checks-plan.mjs in the
-# code repository): the files it touches against main, grouped into parts, and the tests the
-# admin page ticked for those parts (the CHECKS_SETTINGS variable here); the others are skipped.
-# The nightly run on main runs all of them, and a failed app test gets a second try, both unless
-# the admin page turned them off.
+# A run first works out what to test (`plan`, .github/checks-plan.mjs in the code repository, with
+# the admin page's settings: the CHECKS_SETTINGS variable here). The files the change touches
+# are grouped into parts, each test is ticked for some parts, and each tier has its tests:
+#   fast        every push to a branch: the quick tests the change needs (web, rust, windows, mac)
+#   devices     a merge to main that touched the app's parts: android, ios and macapp, each with
+#               a second try when the admin page's switch is on
+#   everything  each night on main, and before a release: every test
+#   none        by hand: every test the change needs, all of them, or a picked list (`tests`)
+# The run's name says what it is and what started it: "Checks · <ref> · <tier> · <reason>", the
+# reason one of push, merge, nightly, release gate, by hand (no tier: "Checks · <ref> · by hand").
 #
-# Nightly on main, and by hand on any branch or commit (Actions → Checks → Run workflow).
-# Needs the secret SOURCE_TOKEN (fine-grained token, Contents: read on pocketgpu/pocketgpu).
+# Started by themselves: start-checks.yml here looks at the code repository's branches every few
+# minutes and starts `fast · push` for a branch that moved and `fast · merge` for main, whose
+# plan starts `devices · merge` beside it when the merge needs it; the schedule below is the
+# nightly run. By hand: the admin page's Checks, or Actions → Checks → Run workflow.
+# A push's run is cancelled by the run of the next push to the same branch; other runs finish.
+#
+# Already tested: a test that passes leaves a small cache entry here, named after the content of
+# the files it covers (`report`). A later run whose files are the same for that test skips it
+# and says so in its summary and as a step of `plan` ("Already tested: Web"). Only passes are
+# kept, for a week, and one is forgotten when the same files fail; nightly runs, release gates,
+# `tests: all` or a list, and `fresh: true` always test for real.
+#
+# On the commit: `plan` and `report` set a commit status in the code repository ("PocketGPU
+# Checks (fast)": running, passed, failed) when SOURCE_TOKEN may; without that they say so and
+# go on (admin/docs/owner-todo.md in the code repository, Checks).
+#
+# Needs the secret SOURCE_TOKEN (fine-grained token, Contents: read on pocketgpu/pocketgpu;
+# with Commit statuses: read and write it also reports to the commit).
 # Run logs are public: nothing here uploads GitHub artifacts or prints secrets; the e2e check keeps
 # its screenshots and logs on the runner except the screens, screen text and films it sends to the push
 # server for the admin page (.github/media-upload.sh, secret PUSH_CHECKS_TOKEN, optional), and every build and test runs through
 # .github/quiet.sh (PGPU_QUIET), which prints pass or fail and an error's headlines but never
 # the lines of code a compiler error quotes. Started and read from the admin page's Checks.
-run-name: Checks · ${{ inputs.ref || 'main (nightly)' }}
+run-name: >-
+  Checks · ${{ inputs.ref || 'main' }}${{ github.event_name == 'schedule' && ' · everything · nightly' || format('{0} · {1}', (inputs.tier && inputs.tier != 'none') && format(' · {0}', inputs.tier) || '', inputs.reason || 'by hand') }}
 
 on:
   workflow_dispatch:
@@ -48,11 +70,35 @@ on:
         description: auto (what the change needs), all, or a list such as web,android
         required: false
         default: auto
+      tier:
+        description: With tests auto, the tier whose tests run; none for every test the change needs
+        type: choice
+        options: [none, fast, devices, everything]
+        default: none
+      reason:
+        description: What started the run (it ends the run's name)
+        type: choice
+        options: [by hand, push, merge, nightly, release gate]
+        default: by hand
+      base:
+        description: For a merge, the commit main was at before it (empty for the commit's parent)
+        required: false
+        default: ''
+      fresh:
+        description: Test for real, also what already passed with the same files
+        type: boolean
+        default: false
   schedule:
     - cron: '23 2 * * *'
 
 permissions:
   contents: read
+
+# A push's run gives way to the run of the next push to the same branch and tier; every other
+# run (a merge, the nightly run, a release gate, by hand) is left to finish.
+concurrency:
+  group: checks-${{ inputs.reason == 'push' && format('{0}-{1}', inputs.ref, inputs.tier) || github.run_id }}
+  cancel-in-progress: ${{ inputs.reason == 'push' }}
 
 env:
   CARGO_TERM_COLOR: never
@@ -63,7 +109,16 @@ jobs:
   # Which tests this run needs; every other job runs only when its answer here is true.
   plan:
     runs-on: ubuntu-latest
+    # actions: the earlier passes are read from this repository's caches, and a merge's Fast run
+    # starts the Devices run.
+    permissions:
+      contents: read
+      actions: write
     outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      tier: ${{ steps.plan.outputs.tier }}
+      testing: ${{ steps.plan.outputs.testing }}
+      reused: ${{ steps.plan.outputs.reused }}
       rust: ${{ steps.plan.outputs.rust }}
       web: ${{ steps.plan.outputs.web }}
       windows: ${{ steps.plan.outputs.windows }}
@@ -71,6 +126,13 @@ jobs:
       android: ${{ steps.plan.outputs.android }}
       ios: ${{ steps.plan.outputs.ios }}
       macapp: ${{ steps.plan.outputs.macapp }}
+      key_rust: ${{ steps.plan.outputs.key_rust }}
+      key_web: ${{ steps.plan.outputs.key_web }}
+      key_windows: ${{ steps.plan.outputs.key_windows }}
+      key_mac: ${{ steps.plan.outputs.key_mac }}
+      key_android: ${{ steps.plan.outputs.key_android }}
+      key_ios: ${{ steps.plan.outputs.key_ios }}
+      key_macapp: ${{ steps.plan.outputs.key_macapp }}
       second_try: ${{ steps.plan.outputs.second_try }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -83,20 +145,106 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
-      # A commit from before the plan existed runs everything.
+      # Every test checks out this commit, not the branch: the branch may move while they run,
+      # and a pass is remembered for exactly these files.
+      - name: The commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # A commit from before the plan existed runs everything; one from before the tiers plans
+      # without them, so its Fast run leaves out the app tests here and its Devices run the rest.
       - name: What this change needs
         id: plan
         env:
           EVENT: ${{ github.event_name }}
           TESTS: ${{ inputs.tests || 'auto' }}
+          TIER: ${{ github.event_name == 'schedule' && 'everything' || inputs.tier || 'none' }}
+          REASON: ${{ github.event_name == 'schedule' && 'nightly' || inputs.reason || 'by hand' }}
+          BASE: ${{ inputs.base }}
+          FRESH: ${{ inputs.fresh }}
           CHECKS_SETTINGS: ${{ vars.CHECKS_SETTINGS }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
+          out="$RUNNER_TEMP/plan.txt"
           if [ -f .github/checks-plan.mjs ]; then
-            node .github/checks-plan.mjs >> "$GITHUB_OUTPUT"
+            node .github/checks-plan.mjs > "$out"
           else
             # Not the Mac app check: its scripts (.github/mac-app/) came after the plan.
-            printf '%s=true\n' rust web windows mac android ios second_try >> "$GITHUB_OUTPUT"
+            printf '%s=true\n' rust web windows mac android ios second_try > "$out"
             echo "This commit has no plan yet, so it runs all but the Mac app." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          if ! grep -q '^tiers=true$' "$out"; then
+            case "$TIER" in
+              fast) sed -i -E 's/^(android|ios|macapp)=.*/\1=false/' "$out" ;;
+              devices) sed -i -E 's/^(rust|web|windows|mac)=.*/\1=false/' "$out" ;;
+            esac
+            printf 'tier=%s\n' "$TIER" >> "$out"
+          fi
+          if grep -qE '^(rust|web|windows|mac|android|ios|macapp)=true$' "$out"; then
+            echo "testing=true" >> "$out"
+          fi
+          cat "$out" >> "$GITHUB_OUTPUT"
+      # One step per test whose earlier pass is reused (the others are skipped): the admin page
+      # tells a reused test from one that wasn't needed by these steps.
+      - name: 'Already tested: Web'
+        if: steps.plan.outputs.reused_web == 'true'
+        run: echo "Web passed with these same files before; its result is reused."
+      - name: 'Already tested: Rust'
+        if: steps.plan.outputs.reused_rust == 'true'
+        run: echo "Rust passed with these same files before; its result is reused."
+      - name: 'Already tested: Windows'
+        if: steps.plan.outputs.reused_windows == 'true'
+        run: echo "Windows passed with these same files before; its result is reused."
+      - name: 'Already tested: Mac'
+        if: steps.plan.outputs.reused_mac == 'true'
+        run: echo "Mac passed with these same files before; its result is reused."
+      - name: 'Already tested: Android'
+        if: steps.plan.outputs.reused_android == 'true'
+        run: echo "Android passed with these same files before; its result is reused."
+      - name: 'Already tested: iPhone'
+        if: steps.plan.outputs.reused_ios == 'true'
+        run: echo "iPhone passed with these same files before; its result is reused."
+      - name: 'Already tested: Mac app'
+        if: steps.plan.outputs.reused_macapp == 'true'
+        run: echo "Mac app passed with these same files before; its result is reused."
+      # A merge that touched the app's parts: Devices runs beside this run, as a run of its own.
+      - name: Start the Devices tier
+        if: steps.plan.outputs.start_devices == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ steps.plan.outputs.base }}
+        run: |
+          gh workflow run checks.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f "ref=$REF" -f tier=devices -f reason=merge -f "base=$BASE" ||
+            { echo "::warning::Couldn't start the Devices run for this merge."; exit 1; }
+      # On the commit and its pull request: "running" while tests run (`report` says how they
+      # went), or at once that everything was already tested. Nothing when no test is needed.
+      - name: Tell the commit
+        if: steps.plan.outputs.testing == 'true' || steps.plan.outputs.reused != ''
+        env:
+          STATUS_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          SHA: ${{ steps.commit.outputs.sha }}
+          TIER: ${{ steps.plan.outputs.tier }}
+          TESTING: ${{ steps.plan.outputs.testing }}
+        run: |
+          context="PocketGPU Checks"
+          [ "$TIER" = none ] || context="$context ($TIER)"
+          state=success
+          text="already tested: result reused"
+          if [ "$TESTING" = true ]; then
+            state=pending
+            text=running
+          fi
+          body=$(jq -n --arg s "$state" --arg c "$context" --arg d "$text" \
+            --arg u "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{state: $s, context: $c, description: $d, target_url: $u}')
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X POST \
+            -H "authorization: Bearer $STATUS_TOKEN" -H 'accept: application/vnd.github+json' \
+            -d "$body" "https://api.github.com/repos/pocketgpu/pocketgpu/statuses/$SHA" 2>/dev/null) || code=000
+          if [ "$code" = 201 ]; then
+            echo "On the commit: $context, $text."
+          else
+            echo "Not on the commit (HTTP $code): SOURCE_TOKEN may not set commit statuses yet."
           fi
 
   agent-windows:
@@ -107,7 +255,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: pocketgpu/pocketgpu
-          ref: ${{ env.REF }}
+          ref: ${{ needs.plan.outputs.sha }}
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -139,7 +287,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: pocketgpu/pocketgpu
-          ref: ${{ env.REF }}
+          ref: ${{ needs.plan.outputs.sha }}
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -175,7 +323,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: pocketgpu/pocketgpu
-          ref: ${{ env.REF }}
+          ref: ${{ needs.plan.outputs.sha }}
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -227,7 +375,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: pocketgpu/pocketgpu
-          ref: ${{ env.REF }}
+          ref: ${{ needs.plan.outputs.sha }}
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -282,7 +430,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: pocketgpu/pocketgpu
-          ref: ${{ env.REF }}
+          ref: ${{ needs.plan.outputs.sha }}
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       # The agent and the stand-in phone, for the runner itself, in their own folder: the
@@ -329,7 +477,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: pocketgpu/pocketgpu
-          ref: ${{ env.REF }}
+          ref: ${{ needs.plan.outputs.sha }}
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       # The built app is kept by the app's code: a run that changes none of it (the e2e check's
@@ -450,7 +598,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: pocketgpu/pocketgpu
-          ref: ${{ env.REF }}
+          ref: ${{ needs.plan.outputs.sha }}
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       # The built app is kept by the app's code, like the iPhone app: a run that changes none of
@@ -549,3 +697,129 @@ jobs:
       - name: Keep the test runner's logs out of the cache
         if: always()
         run: rm -rf ~/Library/Developer/Xcode/DerivedData/WebDriverAgentMac-*/Logs
+
+  # After the tests. Remembers each test that passed, under the key the plan made from the files
+  # it covers, so a later run of the same files can reuse the result; forgets an earlier pass
+  # when the same files fail now; and says on the commit and its pull request how the run went.
+  # It checks out nothing and never fails the run.
+  report:
+    needs: [plan, rust, web, agent-windows, agent-macos, android-e2e, ios-smoke, mac-app-e2e]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.testing == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: write
+    steps:
+      - name: How it went
+        id: went
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p passed
+          echo "$GITHUB_RUN_ID $(date -u +%FT%TZ)" > passed/run.txt
+          forget() {
+            gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=$1-&per_page=100" \
+              --jq '.actions_caches[].id' 2>/dev/null |
+              while read -r cache; do
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$cache" >/dev/null 2>&1 || true
+              done
+          }
+          passed=''
+          failed=''
+          stopped=false
+          while IFS='|' read -r id job name; do
+            result=$(jq -r --arg j "$job" '.[$j].result // ""' <<<"$NEEDS")
+            key=$(jq -r --arg k "key_$id" '.plan.outputs[$k] // ""' <<<"$NEEDS")
+            case "$result" in
+              success)
+                passed="$passed, $name"
+                [ -z "$key" ] || echo "save_$id=$key-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+                ;;
+              failure)
+                failed="$failed, $name"
+                [ -z "$key" ] || forget "$key" || true
+                ;;
+              cancelled) stopped=true ;;
+            esac
+          done <<'TESTS'
+          web|web|Web
+          rust|rust|Rust
+          windows|agent-windows|Windows
+          mac|agent-macos|Mac
+          android|android-e2e|Android
+          ios|ios-smoke|iPhone
+          macapp|mac-app-e2e|Mac app
+          TESTS
+          reused=$(jq -r '.plan.outputs.reused // "" | split(",") | map(select(. != "")) | length' <<<"$NEEDS")
+          if [ -n "$failed" ]; then
+            state=failure
+            text="failed: ${failed#, }"
+          elif [ "$stopped" = true ]; then
+            state=error
+            text=cancelled
+          else
+            state=success
+            text="passed: ${passed#, }"
+            [ "$reused" = 0 ] || text="$text · $reused already tested"
+          fi
+          echo "$text"
+          { echo "state=$state"; echo "text=$text"; } >> "$GITHUB_OUTPUT"
+      - if: steps.went.outputs.save_web
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: passed
+          key: ${{ steps.went.outputs.save_web }}
+      - if: steps.went.outputs.save_rust
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: passed
+          key: ${{ steps.went.outputs.save_rust }}
+      - if: steps.went.outputs.save_windows
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: passed
+          key: ${{ steps.went.outputs.save_windows }}
+      - if: steps.went.outputs.save_mac
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: passed
+          key: ${{ steps.went.outputs.save_mac }}
+      - if: steps.went.outputs.save_android
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: passed
+          key: ${{ steps.went.outputs.save_android }}
+      - if: steps.went.outputs.save_ios
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: passed
+          key: ${{ steps.went.outputs.save_ios }}
+      - if: steps.went.outputs.save_macapp
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: passed
+          key: ${{ steps.went.outputs.save_macapp }}
+      - name: Tell the commit
+        if: always() && steps.went.outputs.state
+        env:
+          STATUS_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          TIER: ${{ needs.plan.outputs.tier }}
+          STATE: ${{ steps.went.outputs.state }}
+          TEXT: ${{ steps.went.outputs.text }}
+        run: |
+          context="PocketGPU Checks"
+          [ "$TIER" = none ] || context="$context ($TIER)"
+          body=$(jq -n --arg s "$STATE" --arg c "$context" --arg d "${TEXT:0:140}" \
+            --arg u "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{state: $s, context: $c, description: $d, target_url: $u}')
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X POST \
+            -H "authorization: Bearer $STATUS_TOKEN" -H 'accept: application/vnd.github+json' \
+            -d "$body" "https://api.github.com/repos/pocketgpu/pocketgpu/statuses/$SHA" 2>/dev/null) || code=000
+          if [ "$code" = 201 ]; then
+            echo "On the commit: $context, $TEXT."
+          else
+            echo "Not on the commit (HTTP $code): SOURCE_TOKEN may not set commit statuses yet."
+          fi

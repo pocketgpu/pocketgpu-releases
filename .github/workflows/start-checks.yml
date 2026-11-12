@@ -1,0 +1,144 @@
+name: Start checks
+
+# Starts Checks by itself, so nobody has to. Every few minutes it looks at the branches of the
+# private code repository pocketgpu/pocketgpu and starts Checks (checks.yml) for each one that
+# moved since the last look:
+#   a branch  →  Checks · <branch> · fast · push   the quick tests the change needs
+#   main      →  Checks · main · fast · merge      the same for the merge; its plan starts
+#                                                  Devices beside it when the merge touched
+#                                                  the app's parts
+# A branch that moved twice between two looks is tested once, at its newest commit. A new branch
+# still at main's commit has nothing of its own to test. Tiers switched off on the admin page
+# (the CHECKS_SETTINGS variable) start nothing. At most ten runs start per look; the rest wait
+# for the next one.
+#
+# It runs here and not in the code repository because a public repository's runners cost no
+# Actions minutes: a workflow there would bill a minute of the private plan for every push. The
+# price is a wait: a push is seen at the next look, about 5 minutes later at most, more when
+# GitHub runs schedules late. Actions → Start checks → Run workflow looks at once.
+#
+# What it saw last is kept as one small cache entry here (seen-<run>): branch names and their
+# commits, which the Checks run names show anyway. The first look, and one after that entry was
+# lost, only remembers and starts nothing. The log is public: it prints branch names and the
+# first seven characters of commits, nothing else.
+#
+# Needs the secret SOURCE_TOKEN (the one Checks uses: Contents: read on pocketgpu/pocketgpu).
+# The source of this file is .github/releases-repo/start-checks.yml in the code repository,
+# copied here by releases-sync.yml there: edit it there, not here.
+on:
+  schedule:
+    - cron: '1-59/5 * * * *'
+  workflow_dispatch:
+
+# actions: starts Checks, and replaces the cache entry.
+permissions:
+  contents: read
+  actions: write
+
+# One look at a time, so two never start the same run.
+concurrency:
+  group: start-checks
+  cancel-in-progress: false
+
+jobs:
+  look:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: What it saw last
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: seen
+          key: seen-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: seen-
+      - name: Start Checks for what moved
+        id: look
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          CHECKS_SETTINGS: ${{ vars.CHECKS_SETTINGS }}
+        run: |
+          mkdir -p seen
+          old=seen/heads.txt
+          now="$RUNNER_TEMP/heads.txt"
+          next="$RUNNER_TEMP/next.txt"
+          # One line per branch: "<commit> <branch>".
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SOURCE_TOKEN" | base64 -w0)"
+          if ! git -c http.extraheader="$auth" ls-remote --heads \
+            https://github.com/pocketgpu/pocketgpu.git 2>/dev/null |
+            sed -E 's#\trefs/heads/# #' | sort -k2 > "$now" || [ ! -s "$now" ]; then
+            echo "Couldn't read the code repository's branches (SOURCE_TOKEN): nothing started."
+            exit 0
+          fi
+          if [ ! -s "$old" ]; then
+            cp "$now" "$old"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "First look: $(wc -l < "$now") branches remembered, nothing started."
+            exit 0
+          fi
+          # A tier is on unless the admin page's settings say it's off.
+          tier() {
+            jq -r "if .tiers.$1.on == false then \"off\" else \"on\" end" \
+              <<<"${CHECKS_SETTINGS:-null}" 2>/dev/null || echo on
+          }
+          fast=$(tier fast)
+          devices=$(tier devices)
+          main_now=$(awk '$2 == "main" { print $1 }' "$now")
+          main_was=$(awk '$2 == "main" { print $1 }' "$old")
+          started=0
+          : > "$next"
+          while read -r sha branch; do
+            was=$(awk -v b="$branch" '$2 == b { print $1 }' "$old")
+            what=''
+            if [ "$sha" = "$was" ]; then
+              :
+            elif [[ ! "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ || "$branch" == *..* ]]; then
+              : # A name Checks wouldn't take.
+            elif [ "$branch" = main ]; then
+              [ "$fast$devices" = offoff ] || what=merge
+            elif [ "$fast" = on ] && [ "$sha" != "$main_now" ] && [ "$sha" != "$main_was" ]; then
+              what=push
+            fi
+            if [ -z "$what" ]; then
+              echo "$sha $branch" >> "$next"
+              continue
+            fi
+            inputs=(-f "ref=$branch" -f tier=fast -f "reason=$what")
+            if [ "$what" = merge ] && [ -n "$was" ]; then
+              inputs+=(-f "base=$was")
+            fi
+            if [ "$started" -lt 10 ] && gh workflow run checks.yml --repo "$GITHUB_REPOSITORY" \
+              --ref "$GITHUB_REF_NAME" "${inputs[@]}" < /dev/null > /dev/null 2>&1; then
+              started=$((started + 1))
+              echo "$sha $branch" >> "$next"
+              echo "$branch is at ${sha:0:7} now: started Checks (fast, $what)."
+            else
+              # Not started (too many at once, or GitHub refused): as it was, for the next look.
+              [ -z "$was" ] || echo "$was $branch" >> "$next"
+              echo "$branch is at ${sha:0:7} now: not started this time, the next look tries again."
+            fi
+          done < "$now"
+          if cmp -s "$next" "$old"; then
+            echo "Nothing moved."
+          else
+            cp "$next" "$old"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Remember
+        if: steps.look.outputs.changed == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: seen
+          key: seen-${{ github.run_id }}-${{ github.run_attempt }}
+      # Only the newest entry is ever read.
+      - name: Forget the older entries
+        if: steps.look.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: seen-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=seen-&per_page=100" \
+            --jq '.actions_caches[] | select(.key != env.KEEP) | .id' 2>/dev/null |
+            while read -r cache; do
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$cache" > /dev/null 2>&1 || true
+            done || true
