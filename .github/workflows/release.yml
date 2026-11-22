@@ -158,13 +158,12 @@ jobs:
           name: agent-macos
           path: pocketgpu-aarch64-macos.tar.gz
 
-  # The desktop app (F31, F34): the phone app built for PCs and laptops. On Windows it is the
-  # one PocketGPU app, with This PC (the old tray app and agent window) and the agent inside,
-  # which it installs for the user. The release waits for the Windows build (the website's
-  # download and the app's updates point at it); the Linux and Mac builds are betas and
-  # never hold it back.
+  # The desktop app (F31, F34): the phone app built for PCs and laptops. Not shipped since
+  # 22 Nov 2026 (the app is phones only; Windows installs the agent with install.ps1). The
+  # job stays so it can come back: set `if:` to true. Releases publish without it.
   client:
     name: Build desktop client (${{ matrix.os }})
+    if: false
     # The Windows app bundles the agent the windows job built, the same binary as the
     # standalone download, rather than compiling it a second time.
     needs: [version, windows]
@@ -295,16 +294,6 @@ jobs:
         with:
           pattern: agent-*
           merge-multiple: true
-      # The website's download button and the desktop app's updates (latest.json) point at the
-      # newest release's Windows installer, so a release never goes out without it. When the
-      # Windows app didn't build, nothing is published: rerun the failed jobs, and this job
-      # publishes everything then.
-      - name: The Windows app is there
-        run: |
-          if [ ! -f PocketGPU-x86_64-setup.exe ]; then
-            echo "::error::The Windows app didn't build, so nothing was published. Rerun the failed jobs."
-            exit 1
-          fi
       # The Windows installer signed for the app's own updates (board 29), here rather than in
       # the build: this job runs none of the app's dependencies, and the signer is a pinned Tauri
       # CLI installed without scripts. The signature is checked against the public key built
@@ -316,6 +305,8 @@ jobs:
           PGPU_UPDATER_PUBKEY: ${{ vars.PGPU_UPDATER_PUBKEY }}
         run: |
           set -euo pipefail
+          # No desktop app in this release (see the client job): nothing to sign.
+          if [ ! -f PocketGPU-x86_64-setup.exe ]; then exit 0; fi
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] || [ -z "$PGPU_UPDATER_PUBKEY" ]; then
             echo "No updater key: the Windows app is published without update signing."
             exit 0
@@ -371,11 +362,8 @@ jobs:
           cat >> notes.md <<'NOTES'
           Install: `curl -fsSL https://pocketgpu.app/install | sh` (Linux, Apple silicon Macs) or
           `irm https://pocketgpu.app/install.ps1 | iex` (Windows). Update: `pgpu update`.
-          Windows: one app, `PocketGPU-x86_64-setup.exe` (beta, unsigned; SmartScreen: More info →
-          Run anyway). It watches your machines like the phone and can share this PC's GPU, and
-          it replaces the older "PocketGPU Agent" app and desktop client: run it once over them,
-          and phones stay paired. Desktop app for Linux (`.deb`, `.AppImage`) and Apple silicon
-          Macs (`.dmg`, then `xattr -dr com.apple.quarantine /Applications/PocketGPU.app`).
+          The desktop app is no longer shipped: use the phone app. Desktop apps already installed
+          keep working without updates.
           Files are listed in SHA256SUMS, signed with minisign (SHA256SUMS.minisig).
           NOTES
           pre=""
