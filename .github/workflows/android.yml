@@ -9,7 +9,8 @@ name: Android
 # Start it from the admin page's Releases (which fills in every input), or Actions → Android →
 # Run workflow. The version is the `version` input, or else app/src-tauri/tauri.conf.json at
 # the chosen ref (Google Play needs a higher one each upload).
-# Nothing is kept as a run artifact: the bundle goes to Google Play and nowhere else.
+# The bundle goes to Google Play and nowhere else: it waits between the build and the upload as
+# a run artifact for a day at most, and is deleted once uploaded (job `forget`).
 # Before beta and production, the app is also opened in an emulator alongside the build (job
 # `check`, the same check CI runs: .github/android/ in the code repository), so a crash shows
 # up as a failed job on the run — but the upload no longer waits for it or depends on its
@@ -25,7 +26,10 @@ name: Android
 #   variables ANDROID_KEY_ALIAS (default: upload), PGPU_DEFAULT_RELAYS, PGPU_PUSH_URL
 # When it ends, the owner hears how it went on their phone and by email (job `tell`,
 # .github/owner-alert.sh, with the secret PUSH_CHECKS_TOKEN that Checks uses; optional).
-# Run logs are public: nothing here may print a secret or the source.
+# Run logs are public: nothing here may print a secret or the source, so the builds run through
+# .github/quiet.sh. The bundle job restores no cache (Checks runs every branch's code in this
+# repository and could leave a poisoned one) and holds no signing or Play key: the upload key
+# and the service account key are only in job `upload`, which runs none of the app's code.
 # The admin page reads the version, track and commit back from this title.
 run-name: Android ${{ inputs.version || 'from ref' }} → ${{ inputs.track }} · ${{ inputs.ref }}
 
@@ -61,7 +65,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The emulator check's builds print only headlines here: these logs are public (.github/quiet.sh).
+  # Builds print only headlines here: these logs are public (.github/quiet.sh).
   PGPU_QUIET: '1'
   PGPU_DEFAULT_RELAYS: ${{ vars.PGPU_DEFAULT_RELAYS }}
   PGPU_PUSH_URL: ${{ vars.PGPU_PUSH_URL }}
@@ -107,19 +111,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
-      # Kept even when a later step fails, so a failed upload doesn't mean a cold rebuild.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: android
-          cache-on-failure: true
-      # Gradle's own downloads (the Android build tools and libraries).
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('app/package-lock.json') }}
-          restore-keys: gradle-${{ runner.os }}-
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -137,17 +128,18 @@ jobs:
           echo "Building app version $v from $REF"
           echo "APP_VERSION=$v" >> "$GITHUB_ENV"
           echo "version=$v" >> "$GITHUB_OUTPUT"
+      # No install scripts: none of the app's packages needs one to build.
       - name: Install UI and Tauri CLI
-        run: npm ci --prefix app
+        run: bash .github/quiet.sh npm ci --prefix app --ignore-scripts
       # The runner has the Android SDK and NDK; the Android project is generated, not committed.
       - name: Generate the Android project
         working-directory: app
         run: |
           export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          npx tauri android init --ci
+          bash ../.github/quiet.sh npx tauri android init --ci
           cp -r src-tauri/icons/android/. src-tauri/gen/android/app/src/main/res/
-      # Signing and Firebase on top of the template; each edit fails loudly if the template moved.
-      - name: Add signing and Firebase
+      # Firebase on top of the template; each edit fails loudly if the template moved.
+      - name: Add Firebase
         working-directory: app/src-tauri/gen/android
         env:
           GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
@@ -168,51 +160,86 @@ jobs:
                '        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:',
                f'        classpath("{plugin}")\n'
                '        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:')
-          edit("app/build.gradle.kts", "    buildTypes {\n",
-               '    signingConfigs {\n'
-               '        create("release") {\n'
-               '            storeFile = file(System.getenv("PGPU_KEYSTORE_FILE"))\n'
-               '            storePassword = System.getenv("PGPU_KEYSTORE_PASSWORD")\n'
-               '            keyAlias = System.getenv("PGPU_KEY_ALIAS")\n'
-               '            keyPassword = System.getenv("PGPU_KEY_PASSWORD")\n'
-               '        }\n'
-               '    }\n'
-               '    buildTypes {\n')
-          edit("app/build.gradle.kts", '        getByName("release") {\n',
-               '        getByName("release") {\n'
-               '            signingConfig = signingConfigs.getByName("release")\n')
           app = pathlib.Path("app/build.gradle.kts")
           app.write_text(app.read_text() + '\napply(plugin = "com.google.gms.google-services")\n')
           PY
+      # Unsigned: the upload key signs it in the next job, which runs none of this build's code.
       - name: Build the bundle
         working-directory: app
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          # ARM only: practically every Android phone. The x86 builds are for emulators and a few
+          # Chromebooks, and would double the Rust build time.
+          bash ../.github/quiet.sh npx tauri android build --aab --ci --target aarch64 --target armv7
+          aab=$(find src-tauri/gen/android/app/build/outputs/bundle -name '*.aab' | head -1)
+          [ -n "$aab" ] || { echo "no .aab was built"; exit 1; }
+          echo "AAB=$PWD/$aab" >> "$GITHUB_ENV"
+          ls -l "$aab"
+      # Kept for a day only, for a rerun of the upload; `forget` deletes it once it is uploaded.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-bundle
+          path: ${{ env.AAB }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Signs the bundle with the upload key and sends it to Google Play, in a job of its own: it
+  # checks out no code and runs nothing the build ran, so nothing a dependency left behind
+  # (a process, $GITHUB_ENV or $GITHUB_PATH) is here with the keys.
+  upload:
+    name: Sign and upload
+    needs: bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: android-bundle
+          path: ${{ runner.temp }}/bundle
+      # The upload key signs the bundle with the JDK's jarsigner, as Google Play expects. Only
+      # whether it verified is printed: the certificate holds the developer's name.
+      - name: Sign the bundle
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           PGPU_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           PGPU_KEY_ALIAS: ${{ vars.ANDROID_KEY_ALIAS || 'upload' }}
         run: |
-          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          export PGPU_KEYSTORE_FILE="$RUNNER_TEMP/upload.jks"
+          set -euo pipefail
+          aab=$(find "$RUNNER_TEMP/bundle" -name '*.aab' | head -1)
+          [ -n "$aab" ] || { echo "::error::the bundle isn't in the artifact"; exit 1; }
+          # The runner image's JDK, by its full path.
+          jarsigner="$JAVA_HOME/bin/jarsigner"
+          [ -x "$jarsigner" ] || { echo "::error::no jarsigner at \$JAVA_HOME"; exit 1; }
+          ks="$RUNNER_TEMP/upload.jks"
           export PGPU_KEY_PASSWORD="${KEY_PASSWORD:-$PGPU_KEYSTORE_PASSWORD}"
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$PGPU_KEYSTORE_FILE"
-          # ARM only: practically every Android phone. The x86 builds are for emulators and a few
-          # Chromebooks, and would double the Rust build time.
-          npx tauri android build --aab --ci --target aarch64 --target armv7
-          rm -f "$PGPU_KEYSTORE_FILE"
-          aab=$(find src-tauri/gen/android/app/build/outputs/bundle -name '*.aab' | head -1)
-          [ -n "$aab" ] || { echo "no .aab was built"; exit 1; }
-          echo "AAB=$PWD/$aab" >> "$GITHUB_ENV"
-          ls -l "$aab"
+          ( umask 077; printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$ks" )
+          log="$RUNNER_TEMP/sign.log"
+          status=0
+          "$jarsigner" -keystore "$ks" -storepass:env PGPU_KEYSTORE_PASSWORD \
+            -keypass:env PGPU_KEY_PASSWORD "$aab" "$PGPU_KEY_ALIAS" > "$log" 2>&1 || status=$?
+          rm -f "$ks"
+          if [ "$status" != 0 ]; then
+            grep -i 'jarsigner error' "$log" | head -3 || true
+            echo "::error::Signing the bundle failed (exit $status)"
+            exit 1
+          fi
+          "$jarsigner" -verify "$aab" > "$log" 2>&1 && grep -q '^jar verified' "$log" ||
+            { echo "::error::The signed bundle doesn't verify"; exit 1; }
+          rm -f "$log"
+          echo "AAB=$aab" >> "$GITHUB_ENV"
+          echo "Signed with the upload key."
       # Google's own API through its auth library, rather than a third-party action, which
-      # would see the service account key.
+      # would see the service account key. Wheels only, so installing runs no package's code.
       - name: Upload to Google Play
         env:
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          APP_VERSION: ${{ needs.bundle.outputs.version }}
           TRACK: ${{ inputs.track }}
           NOTES: ${{ inputs.notes }}
         run: |
-          pip install --quiet google-auth==2.40.3 requests==2.32.4
+          pip install --quiet --only-binary :all: google-auth==2.40.3 requests==2.32.4
           python3 - <<'PY'
           import json, os
           from google.oauth2 import service_account
@@ -246,13 +273,36 @@ jobs:
           print(f"Uploaded {os.environ['APP_VERSION']} (version code {code}) to {track}")
           PY
 
+  # The bundle goes to Google Play and nowhere else: once it is uploaded, the run's copy goes
+  # too (a public repository's artifacts can be downloaded by anyone signed in to GitHub). A
+  # failed upload keeps it for its day, so the failed job can be rerun.
+  forget:
+    name: Forget the bundle
+    needs: upload
+    if: ${{ !cancelled() && needs.upload.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: write
+    steps:
+      - name: Delete the artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=android-bundle" \
+            --jq '.artifacts[].id' | while read -r id; do
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" > /dev/null
+              echo "Deleted the bundle artifact."
+            done
+
   # Tells the owner how the upload went, on their phone and by email (the admin page's Alerts
   # to you says which). The alert script is the one file fetched from the code repository's
   # main; it prints an HTTP code only. Nothing here can fail the run, and a cancelled run tells
   # nothing.
   tell:
     name: Tell the owner
-    needs: [check, bundle]
+    needs: [check, bundle, upload]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -271,7 +321,7 @@ jobs:
         env:
           PGPU_CHECKS_URL: ${{ vars.PGPU_PUSH_URL }}
           PGPU_CHECKS_TOKEN: ${{ secrets.PUSH_CHECKS_TOKEN }}
-          BUNDLE: ${{ needs.bundle.result }}
+          UPLOADED: ${{ needs.upload.result }}
           CHECK: ${{ needs.check.result }}
           VERSION: ${{ needs.bundle.outputs.version || inputs.version }}
           TRACK: ${{ inputs.track }}
@@ -280,7 +330,7 @@ jobs:
             echo "main has no alert script yet: nothing sent."
             exit 0
           fi
-          if [ "$BUNDLE" = success ]; then
+          if [ "$UPLOADED" = success ]; then
             kind=release_finished
             text="Android $VERSION is uploaded to Google Play ($TRACK)."
             [ "$CHECK" != failure ] || text="$text The app check failed: look before trusting it."

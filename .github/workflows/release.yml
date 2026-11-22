@@ -15,7 +15,11 @@ name: Release
 #             empty: n0's public relays and the default push address)
 # When it ends, the owner hears how it went on their phone and by email (job `tell`,
 # .github/owner-alert.sh, with the secret PUSH_CHECKS_TOKEN that Checks uses; optional).
-# Run logs are public: nothing here may print a secret or the source.
+# Run logs are public: nothing here may print a secret or the source. The desktop app is private
+# code, so its builds run through .github/quiet.sh (PGPU_QUIET), which prints pass or fail and an
+# error's headlines but never the lines of code a compiler quotes.
+# No job here restores a cache: Checks runs every branch's code in this repository and could
+# leave a poisoned entry, and these jobs build what users install. Every build starts clean.
 run-name: Release ${{ inputs.tag || github.event.client_payload.tag }}
 
 on:
@@ -76,9 +80,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: release-${{ matrix.target }}
       - name: Install cargo-zigbuild and zig
         # Pinned: these link the signed Linux binaries.
         run: pip install cargo-zigbuild==0.24.0 ziglang==0.17.0
@@ -113,9 +114,6 @@ jobs:
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: release-windows
       # MSVC with a static C runtime: no Visual C++ redistributable needed.
       - name: Version from the tag
         shell: bash
@@ -146,9 +144,6 @@ jobs:
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: release-macos
       - name: Version from the tag
         # Not sed: macOS sed has no `0,/re/` and rejects `s//`. Only the first match changes.
         run: perl -0pi -e 's/^version = ".*"/version = "'"${TAG#v}"'"/m' Cargo.toml
@@ -174,6 +169,8 @@ jobs:
     # standalone download, rather than compiling it a second time.
     needs: [version, windows]
     runs-on: ${{ matrix.os }}
+    env:
+      PGPU_QUIET: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -192,9 +189,6 @@ jobs:
           token: ${{ secrets.SOURCE_TOKEN }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: release-client
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -203,9 +197,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
+      # No install scripts: none of the app's packages needs one to build.
       - name: Install UI and Tauri CLI
         shell: bash
-        run: npm ci --prefix app
+        run: bash .github/quiet.sh npm ci --prefix app --ignore-scripts
       - name: Version from the tag
         shell: bash
         env:
@@ -217,14 +212,15 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then
             # The Windows app carries the agent and installs it for the user (F34). Not next to
             # PocketGPU.exe: Windows names are case-insensitive, so it would replace the app.
-            # With the release key, the installer is signed for the app's own updates (board 29).
-            # The bundler checks the signature against plugins.updater.pubkey, so the public key
-            # goes into the build's config as well as into the app (PGPU_UPDATER_PUBKEY).
+            # With the release key, the app checks its own updates (board 29) against the public
+            # key built in (PGPU_UPDATER_PUBKEY, also in the build's config). The installer is
+            # built unsigned and signed by the `release` job, so the private key never reaches
+            # this build's dependencies.
             updater=false
             if [ -n "$HAS_UPDATER_KEY" ] && [ -n "$PGPU_UPDATER_PUBKEY" ]; then updater=true; fi
             jq -n --arg v "${v%%-*}" --argjson updater "$updater" --arg key "$PGPU_UPDATER_PUBKEY" \
               '{version: $v,
-                bundle: {createUpdaterArtifacts: $updater,
+                bundle: {createUpdaterArtifacts: false,
                          resources: {"resources/pocketgpu.exe": "agent/pocketgpu.exe"}}}
                + (if $updater then {plugins: {updater: {pubkey: $key}}} else {} end)' > app/release.json
             cat app/release.json
@@ -242,23 +238,12 @@ jobs:
         run: |
           mkdir -p app/src-tauri/resources
           tar -xzf agent-windows/pocketgpu-x86_64-windows.tar.gz -C app/src-tauri/resources pocketgpu.exe
-      # The bundler's own downloads (above), kept between releases in Tauri's cache folder, so
-      # once they're there a GitHub hiccup can't stop a release.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/AppData/Local/tauri
-            ~/.cache/tauri
-          key: tauri-tools-${{ runner.os }}-${{ hashFiles('app/package-lock.json') }}
-          restore-keys: tauri-tools-${{ runner.os }}-
       - name: Build
         shell: bash
         working-directory: app
         env:
-          # The desktop app's updates (board 29): the private key signs, the public half is
-          # built into the app. Without them the app simply never offers updates.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # The desktop app's updates (board 29): the public half of the release key is built
+          # into the app. Without it the app simply never offers updates.
           PGPU_UPDATER_PUBKEY: ${{ vars.PGPU_UPDATER_PUBKEY }}
         # Bundling downloads tools from GitHub (NSIS and its plugin on Windows, AppRun on
         # Linux), and those downloads sometimes answer 504 for a few minutes, so a failed build
@@ -268,7 +253,7 @@ jobs:
         # fails the same way each time.
         run: |
           for i in 1 2 3 4; do
-            npx tauri build --bundles ${{ matrix.bundles }} --config release.json && exit 0
+            bash ../.github/quiet.sh npx tauri build --bundles ${{ matrix.bundles }} --config release.json && exit 0
             [ "$i" = 4 ] && exit 1
             echo "::warning::Building the desktop app failed (try $i of 4), most likely a download; again in $((i * 60)) s"
             sleep $((i * 60))
@@ -278,9 +263,7 @@ jobs:
         run: |
           b=target/release/bundle
           case "$RUNNER_OS" in
-            Windows)
-              cp $b/nsis/*-setup.exe PocketGPU-x86_64-setup.exe
-              for f in $b/nsis/*-setup.exe.sig; do [ -f "$f" ] && cp "$f" PocketGPU-x86_64-setup.exe.sig; done ;;
+            Windows) cp $b/nsis/*-setup.exe PocketGPU-x86_64-setup.exe ;;
             Linux)
               cp $b/deb/*.deb PocketGPU-amd64.deb
               cp $b/appimage/*.AppImage PocketGPU-x86_64.AppImage ;;
@@ -291,7 +274,6 @@ jobs:
           name: agent-client-${{ runner.os }}
           path: |
             PocketGPU-x86_64-setup.exe
-            PocketGPU-x86_64-setup.exe.sig
             PocketGPU-amd64.deb
             PocketGPU-x86_64.AppImage
             PocketGPU-aarch64.dmg
@@ -323,6 +305,34 @@ jobs:
             echo "::error::The Windows app didn't build, so nothing was published. Rerun the failed jobs."
             exit 1
           fi
+      # The Windows installer signed for the app's own updates (board 29), here rather than in
+      # the build: this job runs none of the app's dependencies, and the signer is a pinned Tauri
+      # CLI installed without scripts. The signature is checked against the public key built
+      # into the app before anything is published. No key: no updates offered, as before.
+      - name: Sign the Windows app for its updates
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          PGPU_UPDATER_PUBKEY: ${{ vars.PGPU_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] || [ -z "$PGPU_UPDATER_PUBKEY" ]; then
+            echo "No updater key: the Windows app is published without update signing."
+            exit 0
+          fi
+          signer="$RUNNER_TEMP/signer"
+          npm install --silent --no-save --no-package-lock --ignore-scripts --no-audit --no-fund \
+            --prefix "$signer" @tauri-apps/cli@2.12.4
+          "$signer/node_modules/.bin/tauri" signer sign PocketGPU-x86_64-setup.exe > /dev/null
+          rm -rf "$signer"
+          sudo apt-get update -q && sudo apt-get install -y -q minisign > /dev/null
+          check="$RUNNER_TEMP/sigcheck" && mkdir -p "$check"
+          printf '%s' "$PGPU_UPDATER_PUBKEY" | base64 -d > "$check/key.pub"
+          base64 -d PocketGPU-x86_64-setup.exe.sig > "$check/setup.minisig"
+          minisign -Vq -p "$check/key.pub" -m PocketGPU-x86_64-setup.exe -x "$check/setup.minisig" ||
+            { echo "::error::The update signature doesn't match the public key built into the app."; exit 1; }
+          rm -rf "$check"
+          echo "Signed for updates."
       # The desktop app's update manifest (board 29), when the Windows installer was signed.
       - name: latest.json
         run: |

@@ -21,6 +21,10 @@ name: Checks
 #                  with Appium's Mac2 driver: the first screen, pairing by code and live stats,
 #                  filmed from start to end (.github/mac-app/, app/e2e/mac.mjs). In Devices and
 #                  Everything, not in Fast.
+#   audit          known vulnerabilities in the locked dependencies: cargo audit over Cargo.lock
+#                  (agent, push server, app) and npm audit over the app, website and admin page.
+#                  Only in Everything, and never reused: the advisories change, not the files.
+#                  An advisory that doesn't apply goes in .cargo/audit.toml ([advisories] ignore).
 #
 # A run first works out what to test (`plan`, .github/checks-plan.mjs in the code repository, with
 # the admin page's settings: the CHECKS_SETTINGS variable here). The files the change touches
@@ -389,10 +393,11 @@ jobs:
             app/package-lock.json
             web/package-lock.json
             admin/package-lock.json
+            share/package-lock.json
       - name: Install
         shell: bash
         run: |
-          for p in app web admin; do
+          for p in app web admin share; do
             (cd "$p" && bash ../.github/quiet.sh npm ci)
           done
       # Only the locked version: `npx` would otherwise fetch whatever npm serves.
@@ -421,6 +426,58 @@ jobs:
           bash ../.github/quiet.sh npm run lint
           bash ../.github/quiet.sh npm run check
           bash ../.github/quiet.sh npm test
+      # The share page (F48) needs its wasm to type-check: Rust for the browser and the
+      # prebuilt wasm-bindgen of the version share/wasm/build.sh names.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Share page
+        working-directory: share
+        shell: bash
+        run: |
+          v=0.2.122
+          curl -sSfL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$v/wasm-bindgen-$v-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/wasm-bindgen-$v-x86_64-unknown-linux-musl:$PATH"
+          bash ../.github/quiet.sh ./wasm/build.sh
+          bash ../.github/quiet.sh npm run lint
+          bash ../.github/quiet.sh npm run check
+          bash ../.github/quiet.sh npm test
+
+  # Known vulnerabilities in the locked dependencies, in Everything only (nightly and before a
+  # release). It reads the lockfiles; nothing is built. Not one of the plan's tests: a pass
+  # says nothing about tomorrow's advisories, so it is never reused.
+  audit:
+    needs: plan
+    if: needs.plan.outputs.tier == 'everything' && needs.plan.outputs.testing == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pocketgpu/pocketgpu
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # Pinned and built from its own lockfile.
+      - name: Install cargo-audit
+        run: bash .github/quiet.sh cargo install cargo-audit --version 0.22.2 --locked
+      - name: Rust crates
+        run: cargo audit --file Cargo.lock
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      # What ships: the packages each site and the app run, not their build and test tools.
+      - name: npm packages
+        shell: bash
+        run: |
+          status=0
+          for p in app web admin; do
+            echo "== $p"
+            (cd "$p" && npm audit --omit=dev --audit-level=moderate) || status=1
+          done
+          exit "$status"
 
   android-e2e:
     needs: plan
@@ -707,7 +764,7 @@ jobs:
   # tells the owner when a run on main failed. It checks out no code (only the alert script,
   # for that last step) and never fails the run.
   report:
-    needs: [plan, rust, web, agent-windows, agent-macos, android-e2e, ios-smoke, mac-app-e2e]
+    needs: [plan, rust, web, agent-windows, agent-macos, android-e2e, ios-smoke, mac-app-e2e, audit]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.testing == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -755,6 +812,7 @@ jobs:
           android|android-e2e|Android
           ios|ios-smoke|iPhone
           macapp|mac-app-e2e|Mac app
+          audit|audit|Dependencies
           TESTS
           reused=$(jq -r '.plan.outputs.reused // "" | split(",") | map(select(. != "")) | length' <<<"$NEEDS")
           if [ -n "$failed" ]; then
