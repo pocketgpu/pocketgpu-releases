@@ -282,14 +282,31 @@ jobs:
               code = check(s.post(f"{upload}/edits/{edit}/bundles?uploadType=media", data=f,
                                   headers={"Content-Type": "application/octet-stream"},
                                   timeout=900), "Uploading the bundle")["versionCode"]
-          release = {"name": os.environ["APP_VERSION"], "versionCodes": [str(code)],
-                     "status": "completed"}
-          if os.environ.get("NOTES"):
-              release["releaseNotes"] = [{"language": "en-US", "text": os.environ["NOTES"]}]
-          check(s.put(f"{api}/edits/{edit}/tracks/{track}",
-                      json={"track": track, "releases": [release]}), "Setting the track")
-          check(s.post(f"{api}/edits/{edit}:commit"), "Committing")
-          print(f"Uploaded {os.environ['APP_VERSION']} (version code {code}) to {track}")
+          def set_track(status):
+              release = {"name": os.environ["APP_VERSION"], "versionCodes": [str(code)],
+                         "status": status}
+              if os.environ.get("NOTES"):
+                  release["releaseNotes"] = [{"language": "en-US", "text": os.environ["NOTES"]}]
+              check(s.put(f"{api}/edits/{edit}/tracks/{track}",
+                          json={"track": track, "releases": [release]}), "Setting the track")
+
+          set_track("completed")
+          r = s.post(f"{api}/edits/{edit}:commit")
+          # Until its first review passes, Play counts the app as a draft and takes only draft
+          # releases on a track that is reviewed (alpha, beta, production): "Only releases with
+          # status draft may be created on draft app". The same edit, bundle and all, then goes
+          # in as a draft, which waits in Play Console until the owner sends it for review.
+          draft = not r.ok and "draft app" in r.text
+          if draft:
+              set_track("draft")
+              r = s.post(f"{api}/edits/{edit}:commit")
+          check(r, "Committing")
+          print(f"Uploaded {os.environ['APP_VERSION']} (version code {code}) to {track}"
+                + (" as a draft" if draft else ""))
+          if draft:
+              print(f"::notice::The app is still a draft in Play Console, so this {track} release "
+                    "is a draft. Open it in Play Console (Test and release → the track), check "
+                    "it, then Publishing overview → Send changes for review.")
           PY
 
   # The bundle goes to Google Play and nowhere else: once it is uploaded, the run's copy goes
