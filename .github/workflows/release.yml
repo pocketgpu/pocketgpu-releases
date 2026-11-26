@@ -379,8 +379,12 @@ jobs:
               --title "PocketGPU $TAG" --notes-file notes.md $pre "${files[@]}"
           fi
 
+  # Only once the release is published: `latest` and the version's tags never point at a build
+  # the owner was told wasn't published. needs.release alone, as `release` runs past a failed
+  # macos and the skipped client, which would otherwise skip this too.
   docker:
-    needs: build
+    needs: [build, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

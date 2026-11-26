@@ -181,7 +181,8 @@ jobs:
           # The identity's name holds the developer's legal name: count it, don't print it.
           n=$(security find-identity -v -p codesigning "$kc" | grep -c 'Apple Distribution' || true)
           [ "$n" -ge 1 ] || { echo "::error::the distribution identity isn't in the keychain"; exit 1; }
-          rm -f "$dir/identity.p12" "$dir/key.pem"
+          # The whole folder, not only the key and the .p12: nothing in it is needed again.
+          rm -rf "$dir"
           echo "KEYCHAIN=$kc" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:

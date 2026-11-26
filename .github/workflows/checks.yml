@@ -435,9 +435,14 @@ jobs:
         working-directory: share
         shell: bash
         run: |
+          # Checked against its known SHA-256 before it runs (the same as share.yml).
           v=0.2.122
-          curl -sSfL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$v/wasm-bindgen-$v-x86_64-unknown-linux-musl.tar.gz" \
-            | tar -xz -C "$RUNNER_TEMP"
+          sum=122a3fe2ea9c6e3e89b50e42dd1a346e499f3f65a54aae0b4eaeb658139d1e0e
+          tgz="$RUNNER_TEMP/wasm-bindgen-$v.tar.gz"
+          curl -sSfL -o "$tgz" "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$v/wasm-bindgen-$v-x86_64-unknown-linux-musl.tar.gz"
+          echo "$sum  $tgz" | sha256sum -c -
+          tar -xzf "$tgz" -C "$RUNNER_TEMP"
+          rm -f "$tgz"
           export PATH="$RUNNER_TEMP/wasm-bindgen-$v-x86_64-unknown-linux-musl:$PATH"
           bash ../.github/quiet.sh ./wasm/build.sh
           bash ../.github/quiet.sh npm run lint

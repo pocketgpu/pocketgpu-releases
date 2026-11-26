@@ -231,7 +231,10 @@ jobs:
           echo "AAB=$aab" >> "$GITHUB_ENV"
           echo "Signed with the upload key."
       # Google's own API through its auth library, rather than a third-party action, which
-      # would see the service account key. Wheels only, so installing runs no package's code.
+      # would see the service account key. Wheels only, so installing runs no package's code,
+      # and every package, dependencies too, at an exact version with its hash: the process
+      # that holds the key imports nothing PyPI happens to serve that day. They go into a venv
+      # of their own, so nothing else installed on the runner is imported either.
       - name: Upload to Google Play
         env:
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
@@ -239,8 +242,24 @@ jobs:
           TRACK: ${{ inputs.track }}
           NOTES: ${{ inputs.notes }}
         run: |
-          pip install --quiet --only-binary :all: google-auth==2.40.3 requests==2.32.4
-          python3 - <<'PY'
+          reqs="$RUNNER_TEMP/play-requirements.txt"
+          cat > "$reqs" <<'REQ'
+          google-auth==2.40.3 --hash=sha256:1370d4593e86213563547f97a92752fc658456fe4514c809544f330fed45a7ca
+          requests==2.32.4 --hash=sha256:27babd3cda2a6d50b30443204ee89830707d396671944c998b5975b031ac2b2c
+          cachetools==5.5.2 --hash=sha256:d26a22bcc62eb95c3beabd9f1ee5e820d3d2704fe2967cbe350e20c8ffcd3f0a
+          pyasn1-modules==0.4.2 --hash=sha256:29253a9207ce32b64c3ac6600edc75368f98473906e8fd1043bd6b5b1de2c14a
+          rsa==4.9.1 --hash=sha256:68635866661c6836b8d39430f97a996acbd61bfa49406748ea243539fe239762
+          pyasn1==0.6.5 --hash=sha256:4017b0fce125096b8573b39c989fdb1a4b19cf761e683398184550fea0e66587
+          charset-normalizer==3.5.2 --hash=sha256:b6b751274acb69d77b3323d6b7dbaa3c7fdfc1eb829b7eb61d262f32e1af9685
+          idna==3.20 --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+          urllib3==2.8.0 --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
+          certifi==2026.10.23 --hash=sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1
+          REQ
+          py="$RUNNER_TEMP/play-venv"
+          python3 -m venv "$py"
+          "$py/bin/pip" install --quiet --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r "$reqs"
+          "$py/bin/python" - <<'PY'
           import json, os
           from google.oauth2 import service_account
           from google.auth.transport.requests import AuthorizedSession
